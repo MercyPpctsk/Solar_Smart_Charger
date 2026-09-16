@@ -1,0 +1,14 @@
+.pio/
+.vscode/
+# Contains WiFi credentials / tokens - keep out of version control
+src/config.h
+
+# Backup config snapshots are copies of src/config.h -> contain WiFi credentials
+backup/*.h.bak*
+backup/config.h.bak*
+
+# IQAir station ID is per-station private (use config.example.py as template)
+tools/iqair/config.py
+
+# WLAN scan logs contain neighbor network BSSIDs/SSIDs (private)
+docs/wlan_scan.txt

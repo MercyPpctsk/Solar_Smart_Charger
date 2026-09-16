@@ -1,0 +1,185 @@
+โล่งใจ — 3.3V ยังปลอดภัยกับ divider ÷2 ที่ตั้งไว้ตอนนี้ (3.3V÷2=1.65V เข้า ADC สบายๆ) ไม่มีอันตรายเฉพาะหน้า แปลว่าตอนนี้ทดสอบอยู่กับเซลล์เดี่ยว (1S ~3.3V) ไม่ใช่ pack 12V จริง ซึ่งตรงกับที่โค้ด comment ไว้พอดี ("1S Li-ion")
+
+แต่จุดที่ต้องล็อกไว้เป็น to-do เด็ดขาดก่อนเอาไปต่อ pack 12V จริง: ต้องเปลี่ยน divider เป็น ÷11 (100k/10k) และปรับ SOC_HI_V/SOC_LO_V ให้ตรงกับ pack 4S จริง มิฉะนั้นวันที่เอาไปต่อแบตจริงจะลืมแล้วพัง ADC ทันที ผมบันทึกเป็น open item ไว้ในระบบแล้ว
+
+บันทึกลง memory ไฟล์โปรเจกแล้ว ตอนนี้กลับมาตอบคำถามเดิม — เช็ค checklist ค่าที่ firmware ต้องส่งครบรึยัง
+
+สรุปสถานะ — ค่าที่ต้องส่งครบหรือไม่
+ค่า	อ่าน/คำนวณในโค้ดนี้?	ส่งขึ้น ThingsBoard?
+v_solar	✅ A0	❌
+i_solar (i_charge)	✅ A1	❌
+p_solar	❌ ไม่มีการคำนวณเลย	❌
+v_batt	✅ A2 (แต่ divider/threshold ยังผูกกับ 1S bench — ดูข้างบน)	❌
+soc	✅ coulomb counting + LiFePO4 endpoint recal (ทำถูกหลัก ไม่ใช้ Li-ion curve ตาม hard constraint)	❌
+energy_in	❌ ไม่มี	❌
+energy_out	❌ ไม่มี	❌
+i_load (i_discharge)	✅ A3	❌
+p_load	❌ ไม่มีการคำนวณเลย	❌
+status	❌ ไม่มี logic charging/discharging/idle/full/fault	❌
+alert	❌ ไม่มี logic low_battery/fault/V_SOLAR_OV	❌
+uptime	มีแค่ millis() เฉยๆ ยังไม่ map เป็น key	❌
+fw_version, device_id	❌ ไม่มี	❌
+batt_capacity	มีเป็น constant (150Ah) แต่ยังไม่ส่งเป็น attribute	❌
+aqi/pm1/pm25/pm10/temp_air/humidity/pressure	✅ ดึงจาก IQAirClient แล้ว (ผ่าน cloud fetch — เคลียร์ open item เดิมได้ระดับหนึ่ง)	❌
+🔴 สรุปสั้นๆ: ยังไม่ครบ และช่องโหว่ใหญ่สุดคือยังไม่มี MQTT เลย
+
+โค้ดทั้งไฟล์นี้ไม่มี MQTT client อยู่เลย (ไม่มี PubSubClient หรือไลบรารี MQTT ใดๆ, ไม่มีการ publish ไป v1/devices/me/telemetry) — ตอนนี้ค่าทั้งหมดไปจบที่ Serial print + เขียนไฟล์ CSV ลง LittleFS เท่านั้น ไม่มีอะไรขึ้น ThingsBoard สักตัวเดียว ซึ่งเป็นหัวใจของ TOR (real-time monitoring ผ่าน ThingsBoard)
+
+สิ่งที่ทำได้ดีแล้ว (เก็บไว้ต่อยอด):
+
+Non-blocking state machine อ่าน ADS1115 ดีมาก ไม่บล็อก loop()
+SoC ใช้ coulomb counting + endpoint recal ถูกหลัก LiFePO4 (ไม่ใช้ voltage curve ของ Li-ion)
+Auto-zero (BOOT + NVS persist) ครบตามที่ตกลงกันไว้ตอน Stage 2
+IQAir fetch แยก core ป้องกันไม่ให้ค้าง ADC sampler — ออกแบบดี
+NTP + CSV logging ใช้งานได้
+
+สิ่งที่ต้องเพิ่มก่อนถือว่า "ค่าส่งครบ":
+
+MQTT client + publish loop (สำคัญสุด — ไม่มีสิ่งนี้ dashboard จะว่างเปล่า)
+คำนวณ p_solar, p_load
+energy_in/energy_out accumulator + reset เที่ยงคืน
+status/alert logic
+Boot attributes (fw_version, device_id, batt_capacity)
+map uptime เป็น telemetry key
+Light sleep (ยังไม่มีเลยในไฟล์นี้)
+แก้ divider/threshold ของ A2 ก่อนต่อแบตจริง (ตามที่คุยกันไปแล้ว)
+
+อยากให้ผมเริ่มเขียนส่วน MQTT publish ต่อจากโค้ดนี้เลยไหม (ใส่ทุก key ที่ยังขาดในรอบเดียว) หรือจะจัดลำดับความสำคัญเป็นเรื่องๆ ก่อน
+
+เอาแค่มีก่อนส่วน mqtt เดี๋ยวให้อีกคนจัดการ
+
+เข้าใจ — งั้นเน้นแค่ให้ทุกค่าที่ต้องมี "พร้อมอยู่ในตัวแปร" ให้คนที่จะทำ MQTT ต่อหยิบไปส่งได้เลย ไม่ต้องยุ่งกับ PubSubClient ในรอบนี้
+
+หลักการที่ใช้: เพิ่มเป็นฟังก์ชันแยกต่างหาก ไม่แก้ logic เดิมที่ทดสอบผ่านแล้ว (non-blocking sampler, auto-zero, SoC) แค่ต่อพ่วงเข้าไปใน finishReport() ที่เดียว แล้วเก็บผลไว้ใน struct telemetry ที่ MQTT stage อ่านได้ตรงๆ
+
+⚠️ ก่อนใช้จริง: ALERT_VBATT_FAULT_V และ ALERT_VSOLAR_OV_V เป็นแค่ placeholder (ยังไม่ confirm ตามที่คุยไปก่อนหน้า) — ใส่ค่าไว้ให้ compile ผ่านและทดสอบ logic ได้ แต่ ห้าม deploy สนามจริงจนกว่าจะยืนยันตัวเลขจริง
+
+1. เพิ่ม global block ใหม่ (วางต่อจากกลุ่ม static float vZero[4]... เดิม)
+cpp
+// ---- Derived telemetry: p_solar/p_load/energy/status/alert ----------------
+// Computed once per report round in finishReport(). Cached here so a later
+// MQTT stage just reads telemetry.* - no new sampling/timing to add.
+struct TelemetrySnapshot {
+  float       v_solar = 0, i_solar = 0, p_solar = 0;
+  float       v_batt  = 0, soc = 0;
+  float       energy_in_wh = 0, energy_out_wh = 0;
+  float       i_load  = 0, p_load = 0;
+  const char *status  = "idle";
+  String      alert;              // comma-separated tags; "" = no active alert
+  uint32_t    uptime_s = 0;
+};
+static TelemetrySnapshot telemetry;
+
+// ---- Boot attributes (send once at MQTT connect) ---------------------------
+static const char *FW_VERSION       = "0.4.0-pre-mqtt";  // bump on release
+static const char *DEVICE_ID        = "solar-01";        // TODO: 01-04, one per unit before deploying
+static const float BATT_CAPACITY_AH = BAT_CAP_AH;         // single source of truth (already defined above)
+
+// ---- Alert thresholds -------------------------------------------------
+// TODO CRITICAL - both PLACEHOLDER, not yet confirmed. Do NOT field-deploy
+// until real numbers are set (V_SOLAR_OV was explicitly left open in the TOR;
+// VBATT_FAULT must match the real 4S pack's BMS low-voltage cutoff, not the
+// 1S bench-test numbers currently in SOC_HI_V/SOC_LO_V).
+static const float ALERT_SOC_LOW_PCT   = 20.0f;   // TOR-confirmed: soc < 20% -> low_battery
+static const float ALERT_VBATT_FAULT_V = 10.5f;   // PLACEHOLDER
+static const float ALERT_VSOLAR_OV_V   = 24.0f;   // PLACEHOLDER
+
+// ---- energy_in / energy_out (Wh), reset at local midnight ------------------
+static double  energyInWh  = 0.0;
+static double  energyOutWh = 0.0;
+static int     energyDay   = -1;     // day-of-year of last reset; -1 = never yet
+static uint32_t nrgLastMs  = 0;      // own timer, independent of serviceSoC()'s
+
+static void serviceEnergy(float pSolar, float pLoad) {
+  uint32_t now = millis();
+  if (nrgLastMs == 0) { nrgLastMs = now; return; }   // first call: just stamp
+  float dt_h = (float)(now - nrgLastMs) / 3600000.0f;
+  nrgLastMs = now;
+
+  energyInWh  += (double)pSolar * dt_h;
+  energyOutWh += (double)pLoad  * dt_h;
+
+  if (ntpSynced) {
+    time_t t = time(nullptr);
+    struct tm tv; localtime_r(&t, &tv);
+    if (tv.tm_yday != energyDay) {          // date rolled over (or first sync)
+      if (energyDay != -1) {                // skip the "reset" message on first sync
+        Serial.printf("[NRG ] midnight rollover: in=%.2f Wh out=%.2f Wh -> reset\n",
+                      energyInWh, energyOutWh);
+        energyInWh = 0.0;
+        energyOutWh = 0.0;
+      }
+      energyDay = tv.tm_yday;
+    }
+  }
+}
+
+// ---- status / alert derivation ---------------------------------------------
+// Pure functions of the current round's readings - call AFTER serviceSoC()
+// so soc already reflects this round.
+static const char *deriveStatus(float chgA, float disA, float vBatt, float soc) {
+  static const float I_IDLE_A = 0.05f;   // below this, treat channel as "no current"
+  if (vBatt <= ALERT_VBATT_FAULT_V)              return "fault";
+  if (soc >= 99.5f && chgA > I_IDLE_A)           return "full";
+  if (chgA > disA + I_IDLE_A)                    return "charging";
+  if (disA > chgA + I_IDLE_A)                    return "discharging";
+  return "idle";
+}
+
+static String deriveAlert(float vBatt, float vSolar, float soc) {
+  String a;
+  if (soc < ALERT_SOC_LOW_PCT)      a += "low_battery,";
+  if (vBatt <= ALERT_VBATT_FAULT_V) a += "fault,";
+  if (vSolar > ALERT_VSOLAR_OV_V)   a += "V_SOLAR_OV,";
+  if (a.length()) a.remove(a.length() - 1);   // drop trailing comma
+  return a;                                    // "" == no active alert
+}
+2. แก้ finishReport() — เพิ่มท้ายฟังก์ชันเดิม (หลังบรรทัด serviceSoC(vBatt, netA);)
+
+โค้ดเดิมตั้งแต่ float a1Mean... ถึง serviceSoC(vBatt, netA); ไม่ต้องแก้อะไรเลย แค่เพิ่มบล็อกนี้ต่อท้าย ก่อนปิด #endif ของ finishReport():
+
+cpp
+  // ---- Fill the telemetry snapshot for the (future) MQTT stage -----------
+  float vSolar = acc[0].mean() * voltGain[0];
+  float pSolar = vSolar * chgA;
+  float pLoad  = vBatt  * disA;
+  serviceEnergy(pSolar, pLoad);
+
+  telemetry.v_solar      = vSolar;
+  telemetry.i_solar      = chgA;
+  telemetry.p_solar      = pSolar;
+  telemetry.v_batt       = vBatt;
+  telemetry.soc          = socPct;
+  telemetry.i_load       = disA;
+  telemetry.p_load       = pLoad;
+  telemetry.energy_in_wh  = (float)energyInWh;
+  telemetry.energy_out_wh = (float)energyOutWh;
+  telemetry.status       = deriveStatus(chgA, disA, vBatt, socPct);
+  telemetry.alert        = deriveAlert(vBatt, vSolar, socPct);
+  telemetry.uptime_s     = millis() / 1000UL;
+
+หมายเหตุ: vSolar/pSolar/pLoad/serviceEnergy() ใส่ไว้ ภายใน #if ENABLE_NETWORK block เดิม (บล็อกเดียวกับที่มี serviceSoC() อยู่แล้ว) เพราะ serviceEnergy() ต้องพึ่ง ntpSynced เช็ควันเที่ยงคืน — ตรงกับ pattern เดิมของไฟล์นี้พอดี ไม่ต้องเปิด #if ใหม่
+
+3. เพิ่มการดูค่าผ่าน serial (verify ก่อนส่ง MQTT จริง)
+
+แก้ case 't' ในเวอร์ชัน ENABLE_NETWORK ของ handleSerialCmd() เพิ่มบรรทัดท้าย:
+
+cpp
+      Serial.printf("       Status=%s Alert=%s | P_solar=%.2fW P_load=%.2fW | E_in=%.2fWh E_out=%.2fWh | up=%lus\n",
+                    telemetry.status,
+                    telemetry.alert.length() ? telemetry.alert.c_str() : "none",
+                    telemetry.p_solar, telemetry.p_load,
+                    telemetry.energy_in_wh, telemetry.energy_out_wh,
+                    (unsigned long)telemetry.uptime_s);
+เช็คลิสต์ครบแล้วตอนนี้ (ยกเว้นตัว MQTT ที่ยกให้อีกคน)
+ค่า	สถานะ
+v_solar, i_solar, p_solar	✅
+v_batt, soc	✅ (⚠️ divider/threshold ยังผูก bench 1S — ต้องแก้ก่อน pack จริง)
+energy_in, energy_out	✅ รีเซ็ตเที่ยงคืนอัตโนมัติ
+i_load, p_load	✅
+status, alert	✅ (⚠️ threshold เป็น placeholder ต้อง confirm)
+uptime	✅
+fw_version, device_id, batt_capacity	✅ constants พร้อมให้ MQTT stage ส่ง
+IQAir (aqi/pm ฯลฯ)	มีอยู่แล้วจาก iqairSnapshot() เดิม ไม่ต้องแก้
+
+คนที่มาทำ MQTT ต่อแค่อ่านจาก telemetry.* + iqairSnapshot() + boot-attribute constants ทั้ง 3 ตัวได้เลย ไม่ต้องยุ่งกับ ADC/SoC/auto-zero logic อะไรทั้งสิ้น

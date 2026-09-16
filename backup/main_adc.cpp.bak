@@ -1,0 +1,228 @@
+/*
+ * Waveshare ESP32-S3-ETH - Solar charger 4-channel monitor (ADS111x @ 0x48)
+ * -------------------------------------------------------------------------
+ * ADC is on SDA=GPIO1, SCL=GPIO2. Channel roles (NANOTEC solar charger):
+ *   A0 = v_solar      solar-cell voltage      (100k/10k divider, ratio 11)
+ *   A1 = i_charge     current INTO battery    (ACS712, charging)
+ *   A2 = v_batt       battery voltage 1S Li-ion (10k/10k divider, ratio 2)
+ *   A3 = i_discharge  current OUT of battery  (ACS712, load/discharge)
+ *
+ * ACS712 current sensors:
+ *   - Sensitivity = 100 mV/A @ VCC=5V (RATIOMETRIC: scales with VCC)
+ *   - Zero-current output = VCC/2 (auto-calibrated; VCC inferred as 2*Vzero)
+ *   - Current = (Vout - Vzero) / sensitivity
+ *   Small loads (mA) on a 20A sensor sit near the noise floor, so the zero
+ *   point MUST be captured with NO current: turn the load OFF and press the
+ *   onboard BOOT button (GPIO0) to RE-ZERO, then turn the load ON.
+ *
+ * Voltage inputs A0/A2 report pin-voltage * voltGain[] (set the divider ratio
+ * there; 1.0 = direct). NEVER feed a pin above (ADS VDD + 0.3V) into the ADC.
+ * 1S Li-ion tops out ~4.2V; through the /2 divider that is ~2.1V at A2 - safe.
+ *
+ * Onboard WS2812 RGB LED (GPIO21) status:
+ *   BLUE = zeroing     GREEN = reading OK     RED = ADC not responding
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+
+#define RGB_PIN     21
+#define BOOT_BTN    0     // onboard BOOT button, active LOW
+#define I2C_SDA     1
+#define I2C_SCL     2
+#define ADS_ADDR    0x48
+
+// ADS111x / ADS101x register pointers
+#define REG_CONVERSION  0x00
+#define REG_CONFIG      0x01
+
+// PGA = +/-6.144V (gain = 2/3). Full-scale range used for the voltage math.
+static const float FS_VOLTS = 6.144f;
+
+// Base config: OS=1 (start), PGA=000 (+/-6.144V), MODE=1 (single-shot),
+// DR=100 (128SPS on ADS1115), comparator disabled (COMP_QUE=11).
+// MUX bits [14:12] are OR-ed in per channel below.
+static const uint16_t CONFIG_BASE = 0x8183;
+
+// ---- Channel roles -------------------------------------------------------
+// A1, A3 = ACS712 current sensors ; A0, A2 = voltage inputs.
+//   A1 = i_charge (into battery) ; A3 = i_discharge (out of battery/load)
+static const uint8_t CUR_CH[2]  = {1, 3};   // current-sensor channels
+static const uint8_t VOLT_CH[2] = {0, 2};   // voltage-measurement channels
+
+// ACS712-20A: 100 mV/A at the nominal 5V supply. Ratiometric, so we scale it
+// by the measured VCC (VCC = 2 * zero-current output) during calibration.
+static const float ACS712_V_PER_A_AT_5V = 0.100f;
+static const float ACS712_VCC_NOMINAL   = 5.0f;
+
+// Voltage-input scaling: report Vin = Vadc * ratio, where ratio is the
+// resistor-divider factor (R_top+R_bot)/R_bot. Index by ADC channel 0..3.
+//   A0 = v_solar via 100k(top)/10k(bottom) divider -> ratio 11.0 (~1.6V @ 18V)
+//   A2 = v_batt (1S Li-ion) via 10k/10k divider    -> ratio 2.0  (2.1V @ 4.2V)
+// WIRING: R_top in series from the source (+), R_bot to GND. NEVER swap them.
+static const float VDIV_RATIO_SOLAR = (100000.0f + 10000.0f) / 10000.0f;  // = 11.0
+static const float VDIV_RATIO_BATT  = ( 10000.0f + 10000.0f) / 10000.0f;  // = 2.0
+static float voltGain[4] = {VDIV_RATIO_SOLAR, 1.0f, VDIV_RATIO_BATT, 1.0f};
+//                           A0=/11 solar      A1   A2=/2 batt        A3
+
+// Auto-calibrated (assumes no current at cal time). Indexed by ADC channel:
+static float vZero[4] = {2.5f, 2.5f, 2.5f, 2.5f};  // per-channel zero voltage
+static float vPerA    = 0.100f;                    // ACS712 sensitivity (V/A)
+
+static void setLed(uint8_t r, uint8_t g, uint8_t b) {
+  neopixelWrite(RGB_PIN, r, g, b);
+}
+
+// Write a 16-bit value (big-endian) to an ADS register. Returns true on ACK.
+static bool adsWrite16(uint8_t reg, uint16_t value) {
+  Wire.beginTransmission(ADS_ADDR);
+  Wire.write(reg);
+  Wire.write((uint8_t)(value >> 8));
+  Wire.write((uint8_t)(value & 0xFF));
+  return Wire.endTransmission() == 0;
+}
+
+// Read a 16-bit value (big-endian) from an ADS register.
+static bool adsRead16(uint8_t reg, uint16_t &out) {
+  Wire.beginTransmission(ADS_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((uint8_t)ADS_ADDR, (uint8_t)2) != 2) return false;
+  uint8_t hi = Wire.read();
+  uint8_t lo = Wire.read();
+  out = ((uint16_t)hi << 8) | lo;
+  return true;
+}
+
+// Single-shot conversion on single-ended channel (0..3). ok=false on error.
+static int16_t readChannel(uint8_t ch, bool &ok) {
+  uint16_t config = CONFIG_BASE | ((uint16_t)(0x4 | (ch & 0x3)) << 12);
+  if (!adsWrite16(REG_CONFIG, config)) { ok = false; return 0; }
+
+  uint16_t cfg = 0;
+  uint32_t start = millis();
+  do {
+    delay(1);
+    if (!adsRead16(REG_CONFIG, cfg)) { ok = false; return 0; }
+  } while (((cfg & 0x8000) == 0) && (millis() - start < 50));
+
+  uint16_t raw = 0;
+  if (!adsRead16(REG_CONVERSION, raw)) { ok = false; return 0; }
+  ok = true;
+  return (int16_t)raw;   // works for ADS1115 and (left-justified) ADS1015
+}
+
+// Read one channel and convert to volts. ok=false on error.
+static float readChVolts(uint8_t ch, bool &ok) {
+  int16_t raw = readChannel(ch, ok);
+  return ok ? ((float)raw * FS_VOLTS / 32768.0f) : 0.0f;
+}
+
+// Averaged channel voltage over n samples; also returns min/max if requested.
+static float readChAvg(uint8_t ch, int n, bool &ok,
+                       float *vMin = nullptr, float *vMax = nullptr) {
+  double acc = 0; int good = 0;
+  float lo = 1e9f, hi = -1e9f;
+  for (int i = 0; i < n; i++) {
+    bool o = false;
+    float v = readChVolts(ch, o);
+    if (o) { acc += v; good++; if (v < lo) lo = v; if (v > hi) hi = v; }
+  }
+  ok = good > 0;
+  if (vMin) *vMin = lo;
+  if (vMax) *vMax = hi;
+  return ok ? (float)(acc / good) : 0.0f;
+}
+
+// Capture zero-current baselines for BOTH current channels and derive VCC +
+// sensitivity. MUST be called with NO current flowing through the sensors.
+static void calibrateZero() {
+  setLed(0, 0, 40);   // BLUE while zeroing
+  Serial.println("Zeroing current channels A1,A3... (loads OFF)");
+
+  for (int k = 0; k < 2; k++) {
+    uint8_t ch = CUR_CH[k];
+    bool ok = false;
+    float v = readChAvg(ch, 256, ok);
+    if (ok) vZero[ch] = v;
+  }
+
+  // ACS712 is ratiometric: infer VCC from the mid-rail (VCC = 2*Vzero) using
+  // the first current channel, then scale the 5V sensitivity accordingly.
+  float vcc = vZero[CUR_CH[0]] * 2.0f;
+  vPerA = ACS712_V_PER_A_AT_5V * (vcc / ACS712_VCC_NOMINAL);
+  Serial.printf("Zero A1=%.4f V, A3=%.4f V | VCC~=%.2f V | sens=%.1f mV/A\n",
+                vZero[CUR_CH[0]], vZero[CUR_CH[1]], vcc, vPerA * 1000.0f);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println();
+  Serial.println("=== ESP32-S3-ETH Solar charger: A0=v_solar A1=i_charge A2=v_batt A3=i_discharge ===");
+  Serial.printf("ADC 0x%02X @ SDA=%d/SCL=%d | PGA=+/-%.3fV\n",
+                ADS_ADDR, I2C_SDA, I2C_SCL, FS_VOLTS);
+  Serial.println("Press BOOT button to RE-ZERO current sensors with NO current flowing.");
+
+  pinMode(BOOT_BTN, INPUT_PULLUP);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+
+  calibrateZero();   // initial zero (turn load OFF at power-up for best result)
+}
+
+void loop() {
+  // BOOT button (active LOW) triggers a fresh zero calibration on demand.
+  if (digitalRead(BOOT_BTN) == LOW) {
+    delay(30);                                  // debounce
+    if (digitalRead(BOOT_BTN) == LOW) {
+      calibrateZero();
+      while (digitalRead(BOOT_BTN) == LOW) delay(10);  // wait for release
+    }
+  }
+
+  // ---- Voltage channels A0, A2 -----------------------------------------
+  bool okAll = true;
+  float volts[4] = {0, 0, 0, 0};
+  for (int k = 0; k < 2; k++) {
+    uint8_t ch = VOLT_CH[k];
+    bool ok = false;
+    float v = readChAvg(ch, 64, ok);
+    if (!ok) { okAll = false; continue; }
+    volts[ch] = v * voltGain[ch];     // apply divider ratio (1.0 = direct)
+  }
+
+  // ---- Current channels A1, A3 (mean + min/max for ripple) --------------
+  float amps[4] = {0, 0, 0, 0};
+  float ampsPkPk[4] = {0, 0, 0, 0};
+  for (int k = 0; k < 2; k++) {
+    uint8_t ch = CUR_CH[k];
+    bool ok = false;
+    float vMin, vMax;
+    float vAvg = readChAvg(ch, 128, ok, &vMin, &vMax);
+    if (!ok) { okAll = false; continue; }
+    amps[ch]     = (vAvg - vZero[ch]) / vPerA;   // signed current (A)
+    ampsPkPk[ch] = (vMax - vMin) / vPerA;        // peak-to-peak (A)
+  }
+
+  if (!okAll) {
+    Serial.println("ADC read error (no ACK)");
+    setLed(40, 0, 0);   // RED
+    delay(1000);
+    return;
+  }
+
+  Serial.printf(
+    "Solar: %6.3f V  Batt: %6.3f V | Chg: %+8.1f mA (pp %.1f)  "
+    "Dis: %+8.1f mA (pp %.1f)\n",
+    volts[0], volts[2],
+    amps[1] * 1000.0f, ampsPkPk[1] * 1000.0f,
+    amps[3] * 1000.0f, ampsPkPk[3] * 1000.0f);
+
+  setLed(0, 40, 0);   // GREEN
+  delay(500);
+}
+
+
+
+
