@@ -9,7 +9,7 @@
 #define ENABLE_NETWORK 1
 
 // Bench-test guard. 1 = currently on a 1S Li-ion bench cell (~3.3V), NOT the
-// real 4S LiFePO4 pack. When 1, deriveStatus()/deriveAlert() SKIP the
+// real 4S LiFePO4 pack. When 1, deriveBatStatus()/deriveSolStatus() SKIP the
 // battery-fault and solar-fault branches (their thresholds assume a 12V pack,
 // so a 3.3V bench cell would trip "fault" 100% of the time). Only low_battery
 // (from SoC) stays active. Set to 0 and confirm SOC_HI_V/SOC_LO_V + the

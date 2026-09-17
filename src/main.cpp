@@ -54,6 +54,7 @@
 #include <Wire.h>
 #include <Preferences.h>
 #include <stdlib.h>     // qsort (used by the trimmed-mean spike rejection)
+#include <string.h>     // strcmp (used by deriveSolStatus full-battery exception)
 #include "config.h"     // MUST come before the #if ENABLE_NETWORK block below:
                         // config.h defines ENABLE_NETWORK, which gates WiFi/NTP/
                         // LittleFS/IQAir/SoC includes. (Undefined in #if == 0.)
@@ -248,6 +249,7 @@ static const float  BATT_CAPACITY_AH = BAT_CAP_AH;        // single source of tr
 static const float ALERT_SOC_LOW_PCT   = 20.0f;   // TOR 3.2.1: soc < 20% -> low_battery
 static const float ALERT_VBATT_FAULT_V = 10.5f;   // PLACEHOLDER - 4S BMS cutoff
 static const float ALERT_VSOLAR_OV_V   = 24.0f;   // PLACEHOLDER - panel Voc max
+static const float SOLAR_DAY_THRESHOLD_V = 1.0f;  // vSolar above this = panel sees light
 
 struct TelemetryValues {
   // TOR 3.2.2 Voltage Monitor (real-time graph)
@@ -260,9 +262,10 @@ struct TelemetryValues {
   float soh     = 100.0f;           // State of Health [%] via Equivalent Full Cycles
   // TOR 3.2.6 energy produce/consume statistics (reset at local midnight)
   float energy_in_wh  = 0, energy_out_wh = 0;
-  // TOR 3.2.1 notifications + 3.2.6 system overview
-  const char *status = "idle";      // idle|charging|discharging|full|fault
-  String      alert;                // "" or "low_battery,solar_fault,fault"
+  // TOR 3.2.1 notifications (split into 3 subsystems) + 3.2.6 system overview
+  const char *bat_status = "idle";   // full|charging|discharging|low_battery|fault|idle
+  const char *sol_status = "true";   // true|fault
+  const char *iq_status  = "offline";// enable|fetch_fail|offline
   uint32_t    uptime_s = 0;
   // Boot attributes (constant; MQTT stage sends once as shared attributes)
   const char *fw_version    = FW_VERSION;
@@ -340,30 +343,54 @@ static void serviceSoH(float chgA, float disA) {
   }
 }
 
-// ---- status / alert derivation ---------------------------------------------
+// ---- per-subsystem status derivation ---------------------------------------
 // Pure functions of this round's readings - call AFTER serviceSoC() so soc
 // already reflects this round. BENCH_1S skips the voltage-threshold branches
 // (their placeholders target a 12V pack and would always trip on a 1S bench).
-static const char *deriveStatus(float chgA, float disA, float vBatt, float soc) {
+//
+// Battery priority (highest -> lowest):
+//   1. fault        vBatt <= BMS cutoff (4S guard)          -- BENCH_1S skips
+//   2. low_battery  soc < 20%  (covers "device off while not charging")
+//   3. full         soc >= 99.5% && charging into pack
+//   4. charging     net current into battery
+//   5. discharging  net current out to load
+//   6. idle         otherwise
+//
+// Solar fault = panel voltage over Voc  OR  panel sees light but produces no
+// current while the battery is NOT full (the full-battery case is normal: the
+// charger holds off, so current is ~0 in daylight and must NOT be flagged).
+//
+// IQAir status mirrors connectivity + last successful fetch:
+//   offline     WiFi down
+//   fetch_fail  WiFi up but no valid sample yet (server/API error)
+//   enable      WiFi up and a valid sample is cached
+static const char *deriveBatStatus(float chgA, float disA, float vBatt, float soc) {
   static const float I_IDLE_A = 0.05f;   // below this, channel = "no current"
 #if !BENCH_1S
-  if (vBatt <= ALERT_VBATT_FAULT_V)              return "fault";
+  if (vBatt <= ALERT_VBATT_FAULT_V)         return "fault";        // priority 1
 #endif
-  if (soc >= 99.5f && chgA > I_IDLE_A)           return "full";
-  if (chgA > disA + I_IDLE_A)                    return "charging";
-  if (disA > chgA + I_IDLE_A)                    return "discharging";
-  return "idle";
+  if (soc < ALERT_SOC_LOW_PCT)              return "low_battery";  // priority 2
+  if (soc >= 99.5f && chgA > I_IDLE_A)      return "full";         // priority 3
+  if (chgA > disA + I_IDLE_A)               return "charging";     // priority 4
+  if (disA > chgA + I_IDLE_A)               return "discharging";  // priority 5
+  return "idle";                                                     // priority 6
 }
 
-static String deriveAlert(float vBatt, float vSolar, float soc) {
-  String a;
-  if (soc < ALERT_SOC_LOW_PCT)      a += "low_battery,";
+static const char *deriveSolStatus(float vSolar, float chgA, const char *batStatus) {
+  static const float I_IDLE_A = 0.05f;
 #if !BENCH_1S
-  if (vBatt <= ALERT_VBATT_FAULT_V) a += "fault,";
-  if (vSolar > ALERT_VSOLAR_OV_V)   a += "solar_fault,";   // TOR 3.2.1 "Solar Fault"
+  if (vSolar > ALERT_VSOLAR_OV_V)           return "fault";        // over Voc
+  // Panel sees light but produces (near) no current, and the battery is not
+  // full -> a healthy panel in daylight should be delivering current.
+  if (vSolar > SOLAR_DAY_THRESHOLD_V && chgA <= I_IDLE_A &&
+      strcmp(batStatus, "full") != 0)       return "fault";
 #endif
-  if (a.length()) a.remove(a.length() - 1);   // drop trailing comma
-  return a;                                    // "" == no active alert
+  return "true";
+}
+
+static const char *deriveIqStatus(bool wifiUp, bool iqValid) {
+  if (!wifiUp)                              return "offline";
+  return iqValid ? "enable" : "fetch_fail";
 }
 
 // The single read entry point for the MQTT stage (and any other consumer).
@@ -721,8 +748,8 @@ static void handleSerialCmd() {
       if (tv.uptime_s == 0) {
         Serial.println("       [telemetry] snapshot not ready yet");
       } else {
-        Serial.printf("       status=%s alert=\"%s\" | v_solar=%.2fV v_batt=%.2fV\n",
-                      tv.status, tv.alert.c_str(), tv.v_solar, tv.v_batt);
+        Serial.printf("       Bat=%s | Solar=%s | IQAir=%s | v_solar=%.2fV v_batt=%.2fV\n",
+                      tv.bat_status, tv.sol_status, tv.iq_status, tv.v_solar, tv.v_batt);
         Serial.printf("       i_solar=%.3fA p_solar=%.1fW | i_load=%.3fA p_load=%.1fW\n",
                       tv.i_solar, tv.p_solar, tv.i_load, tv.p_load);
         Serial.printf("       SoC=%.1f%% SoH=%.1f%% | energy in=%.2fWh out=%.2fWh | up=%lus\n",
@@ -960,8 +987,11 @@ static void finishReport() {
   telemetry.soh     = sohPct;
   telemetry.energy_in_wh  = (float)energyInWh;
   telemetry.energy_out_wh = (float)energyOutWh;
-  telemetry.status   = deriveStatus(chgA, disA, vBatt, socPct);
-  telemetry.alert    = deriveAlert(vBatt, vSolar, socPct);
+  // NOTE: deriveSolStatus reads telemetry.bat_status, so bat_status must be
+  // assigned first (it is on the line below).
+  telemetry.bat_status = deriveBatStatus(chgA, disA, vBatt, socPct);
+  telemetry.sol_status = deriveSolStatus(vSolar, chgA, telemetry.bat_status);
+  telemetry.iq_status  = deriveIqStatus(WiFi.status() == WL_CONNECTED, iqOk);
   telemetry.uptime_s = millis() / 1000UL;
   // boot attributes are const defaults in the struct; no need to rewrite them.
   telemetry.iq_valid = iqOk;
