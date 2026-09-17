@@ -38,7 +38,7 @@ NTP + CSV logging ใช้งานได้
 MQTT client + publish loop (สำคัญสุด — ไม่มีสิ่งนี้ dashboard จะว่างเปล่า)
 คำนวณ p_solar, p_load
 energy_in/energy_out accumulator + reset เที่ยงคืน
-status/alert logic
+status/alert logic → แยกเป็น bat_status/sol_status/iq_status
 Boot attributes (fw_version, device_id, batt_capacity)
 map uptime เป็น telemetry key
 Light sleep (ยังไม่มีเลยในไฟล์นี้)
@@ -56,7 +56,7 @@ Light sleep (ยังไม่มีเลยในไฟล์นี้)
 
 1. เพิ่ม global block ใหม่ (วางต่อจากกลุ่ม static float vZero[4]... เดิม)
 cpp
-// ---- Derived telemetry: p_solar/p_load/energy/status/alert ----------------
+// ---- Derived telemetry: p_solar/p_load/energy/bat_status/sol_status/iq_status
 // Computed once per report round in finishReport(). Cached here so a later
 // MQTT stage just reads telemetry.* - no new sampling/timing to add.
 struct TelemetrySnapshot {
@@ -64,8 +64,9 @@ struct TelemetrySnapshot {
   float       v_batt  = 0, soc = 0;
   float       energy_in_wh = 0, energy_out_wh = 0;
   float       i_load  = 0, p_load = 0;
-  const char *status  = "idle";
-  String      alert;              // comma-separated tags; "" = no active alert
+  const char *bat_status = "idle";   // full|charging|discharging|low_battery|fault|idle
+  const char *sol_status = "true";   // true|fault
+  const char *iq_status  = "offline";// enable|fetch_fail|offline
   uint32_t    uptime_s = 0;
 };
 static TelemetrySnapshot telemetry;
@@ -114,25 +115,30 @@ static void serviceEnergy(float pSolar, float pLoad) {
   }
 }
 
-// ---- status / alert derivation ---------------------------------------------
+// ---- per-subsystem status derivation ---------------------------------------
 // Pure functions of the current round's readings - call AFTER serviceSoC()
 // so soc already reflects this round.
-static const char *deriveStatus(float chgA, float disA, float vBatt, float soc) {
+static const char *deriveBatStatus(float chgA, float disA, float vBatt, float soc) {
   static const float I_IDLE_A = 0.05f;   // below this, treat channel as "no current"
-  if (vBatt <= ALERT_VBATT_FAULT_V)              return "fault";
-  if (soc >= 99.5f && chgA > I_IDLE_A)           return "full";
-  if (chgA > disA + I_IDLE_A)                    return "charging";
-  if (disA > chgA + I_IDLE_A)                    return "discharging";
-  return "idle";
+  if (vBatt <= ALERT_VBATT_FAULT_V)         return "fault";        // priority 1
+  if (soc < ALERT_SOC_LOW_PCT)              return "low_battery";  // priority 2
+  if (soc >= 99.5f && chgA > I_IDLE_A)      return "full";         // priority 3
+  if (chgA > disA + I_IDLE_A)               return "charging";     // priority 4
+  if (disA > chgA + I_IDLE_A)               return "discharging";  // priority 5
+  return "idle";                                                     // priority 6
 }
 
-static String deriveAlert(float vBatt, float vSolar, float soc) {
-  String a;
-  if (soc < ALERT_SOC_LOW_PCT)      a += "low_battery,";
-  if (vBatt <= ALERT_VBATT_FAULT_V) a += "fault,";
-  if (vSolar > ALERT_VSOLAR_OV_V)   a += "V_SOLAR_OV,";
-  if (a.length()) a.remove(a.length() - 1);   // drop trailing comma
-  return a;                                    // "" == no active alert
+static const char *deriveSolStatus(float vSolar, float chgA, const char *batStatus) {
+  static const float I_IDLE_A = 0.05f;
+  if (vSolar > ALERT_VSOLAR_OV_V)           return "fault";        // over Voc
+  if (vSolar > SOLAR_DAY_THRESHOLD_V && chgA <= I_IDLE_A &&
+      strcmp(batStatus, "full") != 0)       return "fault";        // has light, no output
+  return "true";
+}
+
+static const char *deriveIqStatus(bool wifiUp, bool iqValid) {
+  if (!wifiUp)                              return "offline";
+  return iqValid ? "enable" : "fetch_fail";
 }
 2. แก้ finishReport() — เพิ่มท้ายฟังก์ชันเดิม (หลังบรรทัด serviceSoC(vBatt, netA);)
 
@@ -154,8 +160,9 @@ cpp
   telemetry.p_load       = pLoad;
   telemetry.energy_in_wh  = (float)energyInWh;
   telemetry.energy_out_wh = (float)energyOutWh;
-  telemetry.status       = deriveStatus(chgA, disA, vBatt, socPct);
-  telemetry.alert        = deriveAlert(vBatt, vSolar, socPct);
+  telemetry.bat_status = deriveBatStatus(chgA, disA, vBatt, socPct);
+  telemetry.sol_status = deriveSolStatus(vSolar, chgA, telemetry.bat_status);
+  telemetry.iq_status  = deriveIqStatus(WiFi.status() == WL_CONNECTED, iqOk);
   telemetry.uptime_s     = millis() / 1000UL;
 
 หมายเหตุ: vSolar/pSolar/pLoad/serviceEnergy() ใส่ไว้ ภายใน #if ENABLE_NETWORK block เดิม (บล็อกเดียวกับที่มี serviceSoC() อยู่แล้ว) เพราะ serviceEnergy() ต้องพึ่ง ntpSynced เช็ควันเที่ยงคืน — ตรงกับ pattern เดิมของไฟล์นี้พอดี ไม่ต้องเปิด #if ใหม่
@@ -165,9 +172,8 @@ cpp
 แก้ case 't' ในเวอร์ชัน ENABLE_NETWORK ของ handleSerialCmd() เพิ่มบรรทัดท้าย:
 
 cpp
-      Serial.printf("       Status=%s Alert=%s | P_solar=%.2fW P_load=%.2fW | E_in=%.2fWh E_out=%.2fWh | up=%lus\n",
-                    telemetry.status,
-                    telemetry.alert.length() ? telemetry.alert.c_str() : "none",
+      Serial.printf("       Bat=%s | Solar=%s | IQAir=%s | P_solar=%.2fW P_load=%.2fW | E_in=%.2fWh E_out=%.2fWh | up=%lus\n",
+                    telemetry.bat_status, telemetry.sol_status, telemetry.iq_status,
                     telemetry.p_solar, telemetry.p_load,
                     telemetry.energy_in_wh, telemetry.energy_out_wh,
                     (unsigned long)telemetry.uptime_s);
@@ -177,7 +183,7 @@ v_solar, i_solar, p_solar	✅
 v_batt, soc	✅ (⚠️ divider/threshold ยังผูก bench 1S — ต้องแก้ก่อน pack จริง)
 energy_in, energy_out	✅ รีเซ็ตเที่ยงคืนอัตโนมัติ
 i_load, p_load	✅
-status, alert	✅ (⚠️ threshold เป็น placeholder ต้อง confirm)
+| bat_status, sol_status, iq_status | ✅ (⚠️ threshold เป็น placeholder ต้อง confirm)
 uptime	✅
 fw_version, device_id, batt_capacity	✅ constants พร้อมให้ MQTT stage ส่ง
 IQAir (aqi/pm ฯลฯ)	มีอยู่แล้วจาก iqairSnapshot() เดิม ไม่ต้องแก้

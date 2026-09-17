@@ -149,7 +149,7 @@ pio run -t upload && pio device monitor
   4. serviceEnergy(pSolar, pLoad) → สะสม Wh + รีเซ็ตเที่ยงคืน
   5. serviceSoH(chgA, disA)   → สะสม |Ah| + คำนวณ SoH (EFC)
   6. iqairSnapshot(iq)        → อ่าน snapshot IQAir (ล็อก iqairMutex, ปล่อยก่อนขั้นถัดไป)
-  7. deriveStatus() + deriveAlert() → สถานะ/แจ้งเตือน
+  7. deriveBatStatus() + deriveSolStatus() + deriveIqStatus() → สถานะ 3 ระบบ
   8. xSemaphoreTake(telemetryMutex) → เขียนทุกฟิลด์ลง `telemetry` → ปล่อย
 
 ทุก 30 นาที (core 0, iqairTask):
@@ -187,18 +187,21 @@ NVS persist (กันไฟดับ):
 | | `soc` | coulomb counting + endpoint recal 3.65V/2.50V |
 | **3.2.5 Battery Health** | `soh` | Equivalent Full Cycles: `EFC = ahThroughput/(2×CAP)` → `SoH = 100 − (EFC/CYCLE_LIFE)×(100−EOL)` |
 | **3.2.6 Energy stats** | `energy_in_wh`, `energy_out_wh` | สะสม `Σ p×dt` (Wh), รีเซ็ตเที่ยงคืน |
-| **3.2.1 Notifications** | `status`, `alert` | `deriveStatus()` / `deriveAlert()` (ดูด้านล่าง) |
+| **3.2.1 Notifications** | `bat_status`, `sol_status`, `iq_status` | `deriveBatStatus()` / `deriveSolStatus()` / `deriveIqStatus()` (ดูด้านล่าง) |
 | **3.2.6 System** | `uptime_s` | `millis()/1000` |
 | **Boot attributes** | `fw_version`, `device_id`, `batt_capacity` | const (ส่งครั้งเดียวเป็น shared attributes) |
 | **3.2.6 IQAir** | `aqi_us`, `pm1`, `pm25`, `pm10`, `temp_c`, `humidity`, `pressure`, `iq_ts` | IQAir fetch (core 0) → snapshot |
 
-### `status` (enum string)
-`idle` | `charging` | `discharging` | `full` | `fault`
+### `bat_status` (enum string — ระบบแบตเตอรี่, priority สูง→ต่ำ)
+`fault` (vBatt ≤ cutoff) | `low_battery` (soc < 20%) | `full` (soc ≥ 99.5% && กำลังชาร์จ) | `charging` | `discharging` | `idle`
 
-### `alert` (comma-separated string, `""` = ไม่มีแจ้งเตือน)
-`low_battery` (soc < 20%) | `fault` (vBatt ≤ cutoff) | `solar_fault` (vSolar > Voc max)
+### `sol_status` (enum string — ระบบโซลาร์)
+`true` (ปกติ) | `fault` (vSolar > Voc max หรือ มีแสง vSolar > 1V แต่ไม่ผลิตกระแส และแบตยังไม่เต็ม)
 
-> 🔧 **`BENCH_1S` guard:** ตอน `BENCH_1S=1` สาขา `fault` และ `solar_fault` ถูกข้าม (threshold เป็น placeholder สำหรับ pack 12V) เหลือเฉพาะ `low_battery` ที่ทำงาน
+### `iq_status` (enum string — ระบบ IQAir)
+`enable` (WiFi ต่อ + มีข้อมูลล่าสุด) | `fetch_fail` (WiFi ต่อ แต่ดึงข้อมูลไม่ได้) | `offline` (WiFi หลุด)
+
+> 🔧 **`BENCH_1S` guard:** ตอน `BENCH_1S=1` สาขา `fault` ของแบตและ `fault` ของโซลาร์ถูกข้าม (threshold เป็น placeholder สำหรับ pack 12V) เหลือเฉพาะ `low_battery` ที่ทำงาน; `sol_status` ออกมาเป็น `true` ตลอด
 ---
 
 ## 8. ส่วน MQTT Dev Handoff (สำหรับคนต่อยอด)
@@ -211,8 +214,9 @@ NVS persist (กันไฟดับ):
 struct TelemetryValues {
   float v_solar, v_batt, i_solar, p_solar, i_load, p_load;
   float soc, soh, energy_in_wh, energy_out_wh;
-  const char *status;   // "idle"|"charging"|"discharging"|"full"|"fault"
-  String      alert;    // "" หรือ "low_battery,solar_fault"
+  const char *bat_status = "idle";   // full|charging|discharging|low_battery|fault|idle
+  const char *sol_status = "true";   // true|fault
+  const char *iq_status  = "offline";// enable|fetch_fail|offline
   uint32_t    uptime_s;
   const char *fw_version, *device_id;  float batt_capacity;
   bool iq_valid; int aqi_us; float pm1, pm25, pm10, temp_c, humidity, pressure; String iq_ts;
@@ -240,8 +244,9 @@ if (tv.uptime_s == 0) return;   // snapshot ยังไม่พร้อม (s
 | `soh` | `soh` | 3.2.5 |
 | `energy_in_wh` | `energy_in` | 3.2.6 |
 | `energy_out_wh` | `energy_out` | 3.2.6 |
-| `status` | `status` | 3.2.1/3.2.6 |
-| `alert` | `alert` | 3.2.1 |
+| `bat_status` | `bat_status` | 3.2.1 |
+| `sol_status` | `sol_status` | 3.2.1 |
+| `iq_status` | `iq_status` | 3.2.1 |
 | `uptime_s` | `uptime` | 3.2.6 |
 | `aqi_us`,`pm1`,`pm25`,`pm10` | `aqi`,`pm1`,`pm25`,`pm10` | 3.2.6 |
 | `temp_c`,`humidity`,`pressure` | `temp_air`,`humidity`,`pressure` | 3.2.6 |
