@@ -21,6 +21,7 @@ struct IQAirData {
 class IQAirClient {
 public:
   explicit IQAirClient(const char* stationUrl) : _url(stationUrl) {}
+  void setUrl(const char* stationUrl) { _url = stationUrl; }
 
   // เรียกได้ตรงๆ ไม่ต้อง check interval เอง — เช็คให้แล้วข้างใน
   // คืน true เฉพาะตอนที่ "ยิง request จริง" (ไม่ว่าจะสำเร็จหรือ fail)

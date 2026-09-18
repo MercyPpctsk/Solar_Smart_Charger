@@ -1,5 +1,9 @@
 .pio/
 .vscode/
+
+# PlatformIO build artifact (IDE intellisense, regenerated on build) - machine-specific
+compile_commands.json
+
 # Contains WiFi credentials / tokens - keep out of version control
 src/config.h
 

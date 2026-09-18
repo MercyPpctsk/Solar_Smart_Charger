@@ -67,6 +67,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include "iqair_client.h"   // sync fetch() runs on a pinned core-0 task (non-blocking to loop)
+#include <PubSubClient.h>   // ThingsBoard MQTT client (runs on core 0)
+#include "setup_web.h"      // SoftAP + Web configuration portal
 #endif
 
 #define RGB_PIN     21
@@ -141,7 +143,11 @@ static float vPerA    = 0.100f;                    // ACS712 sensitivity (V/A)
 // (verified 2026-09-15: raw A1 rises ABOVE its zero point while charging),
 // the physical polarity is already correct, so NO flip is applied. Set to
 // -1.0f only if the sensors are ever physically re-oriented.
-static const float CUR_SIGN_FLIP = 1.0f;
+// Direction sign:
+//   A1 (Charge into battery): Vout rises ABOVE zero point -> +1.0f
+//   A3 (Discharge to load):   Vout drops BELOW zero point -> -1.0f (flip so +Dis = positive load)
+static const float CUR_SIGN_FLIP_CHG =  1.0f;
+static const float CUR_SIGN_FLIP_DIS = -1.0f;
 
 // ---- Stage 2: NVS-persisted zero calibration ------------------------------
 // A zero captured via the BOOT button is stored in NVS and reused across
@@ -412,8 +418,9 @@ static TelemetryValues getValue() {
 
 static void wifiNtpBegin() {
   WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
+  WiFi.setAutoReconnect(false);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
   // Print the disconnect REASON once per attempt burst: 201 = AP not found
   // (out of range / 5 GHz only), 15 = wrong password, 2 = auth timeout.
   static bool reasonHookInstalled = false;
@@ -427,14 +434,27 @@ static void wifiNtpBegin() {
                     info.wifi_sta_disconnected.reason);
     }, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   }
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("[NET ] WiFi connecting to \"%s\"; NTP %s,%s (TZ %s)\n",
-                WIFI_SSID, NTP_SERVER_1, NTP_SERVER_2, TZ_STRING);
+  if (appConfig.wifi_ssid[0] != '\0') {
+    WiFi.begin(appConfig.wifi_ssid, appConfig.wifi_pass);
+    Serial.printf("[NET ] WiFi connecting to \"%s\"; NTP %s,%s (TZ %s)\n",
+                  appConfig.wifi_ssid, NTP_SERVER_1, NTP_SERVER_2, TZ_STRING);
+  } else {
+    Serial.println("[NET ] No WiFi SSID configured yet. Connect to SoftAP to configure.");
+  }
   configTzTime(TZ_STRING, NTP_SERVER_1, NTP_SERVER_2);
 }
 
 // Polled at 1 Hz max; prints state CHANGES only, never blocks loop().
 static void serviceNetwork() {
+  if (g_wifiChanged) {
+    g_wifiChanged = false;
+    Serial.printf("[NET ] Applying new WiFi SSID: \"%s\"...\n", appConfig.wifi_ssid);
+    WiFi.disconnect();
+    if (appConfig.wifi_ssid[0] != '\0') {
+      WiFi.begin(appConfig.wifi_ssid, appConfig.wifi_pass);
+    }
+  }
+
   static uint32_t lastMs = 0;
   static bool     wifiUp = false;
   uint32_t now = millis();
@@ -461,6 +481,8 @@ static void serviceNetwork() {
 // ---- Stage 5: IQAir fetch task (core 0) + control helpers -------------------
 // Runs on core 0 (the WiFi core): waits for WiFi, then loops fetch() -> snapshot
 // copy. The synchronous fetch() blocks HERE (core 0) but never on the ADC's
+static bool g_newIqairReady = false;
+
 // core 1. 'i' / setSoc notify it via xTaskNotifyGive for an immediate fetch.
 static void iqairTask(void *arg) {
   Serial.println("[IQAir] task started (core 0), waiting for WiFi...");
@@ -470,8 +492,9 @@ static void iqairTask(void *arg) {
   IQAirData local;          // scratch buffer: fetch() prints its own [IQAir] line
   bool first = true;
   for (;;) {
-    // Sleep IQAIR_INTERVAL_MS, unless notified (immediate fetch via 'i').
-    if (!first) ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(IQAIR_INTERVAL_MS));
+    // Sleep dynamic interval (default 30 min), unless notified (immediate fetch via 'i').
+    uint32_t intervalMs = (appConfig.iqair_interval > 0 ? appConfig.iqair_interval : 30) * 60000UL;
+    if (!first) ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(intervalMs));
     first = false;
 
     // If WiFi dropped during the wait, hold until it is back so we never
@@ -480,6 +503,13 @@ static void iqairTask(void *arg) {
       Serial.println("[IQAir] WiFi lost, pausing fetch loop");
       while (WiFi.status() != WL_CONNECTED) vTaskDelay(pdMS_TO_TICKS(5000));
       Serial.println("[IQAir] WiFi back, resuming fetch loop");
+    }
+
+    if (g_iqairChanged) {
+      g_iqairChanged = false;
+      iqair.setUrl(appConfig.iqair_url);
+      Serial.printf("[IQAir] URL updated to '%s' (interval: %u min)\n",
+                    appConfig.iqair_url, appConfig.iqair_interval);
     }
 
     // fetch() is synchronous (TLS + HTTP GET ~1-2 s) but we are on core 0
@@ -491,6 +521,7 @@ static void iqairTask(void *arg) {
       xSemaphoreTake(iqairMutex, portMAX_DELAY);
       iqairData = local;
       xSemaphoreGive(iqairMutex);
+      g_newIqairReady = true;  // Flag for ThingsBoard to publish separate IQAir telemetry
     }
   }
 }
@@ -512,6 +543,9 @@ static void iqairRequestFetch() {
 }
 
 static void iqairBegin() {
+  if (appConfig.iqair_url[0] != '\0') {
+    iqair.setUrl(appConfig.iqair_url);
+  }
   iqairMutex = xSemaphoreCreateMutex();
   // Pin to core 0 (IQAIR_TASK_CORE): loop()/ADC run on core 1, WiFi on core 0.
   // Putting the blocking fetch on the WiFi core keeps the ADC sampler on core 1
@@ -519,6 +553,178 @@ static void iqairBegin() {
   xTaskCreatePinnedToCore(iqairTask, "iqair", IQAIR_TASK_STACK, nullptr,
                          1, &iqairTaskHandle, IQAIR_TASK_CORE);
 }
+
+// ---- Stage 8: ThingsBoard MQTT integration (pinned to Core 0) --------------
+// Runs on core 0 (the WiFi/network core). Never touches ADC sampler on core 1.
+// Reads telemetry snapshot via getValue() with 10 ms bounded mutex lock.
+static WiFiClient       tbWifiClient;
+static PubSubClient     tbMqtt(tbWifiClient);
+static TaskHandle_t     tbTaskHandle = nullptr;
+static const uint32_t   TB_TASK_STACK = 8192;
+static const BaseType_t TB_TASK_CORE  = 0;          // WiFi core; NOT the ADC core
+
+static void tbPublishAttributes(const TelemetryValues &tv) {
+  JsonDocument doc;
+  doc["fw_version"]    = tv.fw_version;
+  doc["device_id"]     = (appConfig.dev_name[0] != '\0') ? appConfig.dev_name : tv.device_id;
+  doc["batt_capacity"] = tv.batt_capacity;
+
+  char buf[256];
+  size_t len = serializeJson(doc, buf, sizeof(buf));
+  if (len > 0) {
+    bool ok = tbMqtt.publish(TB_MQTT_TOPIC_ATTRIBUTES, buf);
+    Serial.printf("[TB  ] Attributes sent (%u B): %s [%s]\n",
+                  (unsigned)len, buf, ok ? "OK" : "FAILED");
+  }
+}
+
+static void tbPublishIQAir(const IQAirData &iq) {
+  if (!iq.valid) return;
+  JsonDocument doc;
+  doc["aqi"]      = iq.aqi_us;
+  doc["pm1"]      = serialized(String(iq.pm1, 1));
+  doc["pm25"]     = serialized(String(iq.pm25, 1));
+  doc["pm10"]     = serialized(String(iq.pm10, 1));
+  doc["temp_air"] = serialized(String(iq.temp_c, 1));
+  doc["humidity"] = serialized(String(iq.humidity, 0));
+  doc["pressure"] = serialized(String(iq.pressure, 1));
+
+  char buf[256];
+  size_t len = serializeJson(doc, buf, sizeof(buf));
+  if (len > 0) {
+    const char* topic = (appConfig.tb_topic[0] != '\0') ? appConfig.tb_topic : TB_MQTT_TOPIC_TELEMETRY;
+    bool ok = tbMqtt.publish(topic, buf);
+    Serial.printf("[TB  ] IQAir Telemetry sent (%u B) [%s]\n", (unsigned)len, ok ? "OK" : "FAILED");
+    if (!ok) {
+      Serial.printf("[TB  ] IQAir publish failed, payload: %s\n", buf);
+    }
+  }
+}
+
+static void tbPublishTelemetry(const TelemetryValues &tv) {
+  JsonDocument doc;
+  // 3.2.2 Voltage Monitor
+  doc["v_solar"]        = serialized(String(tv.v_solar, 2));
+  doc["v_batt"]         = serialized(String(tv.v_batt, 2));
+  // 3.2.4 Battery Condition
+  doc["i_solar"]        = serialized(String(tv.i_solar, 3));
+  doc["p_solar"]        = serialized(String(tv.p_solar, 1));
+  doc["i_load"]         = serialized(String(tv.i_load, 3));
+  doc["p_load"]         = serialized(String(tv.p_load, 1));
+  doc["soc"]            = serialized(String(tv.soc, 1));
+  // 3.2.5 Battery Health
+  doc["soh"]            = serialized(String(tv.soh, 1));
+  // 3.2.6 Energy stats
+  doc["energy_in"]      = serialized(String(tv.energy_in_wh, 2));
+  doc["energy_out"]     = serialized(String(tv.energy_out_wh, 2));
+  // TOR 3.2.1 Subsystem statuses (V02 NEW KEYS!)
+  doc["bat_status"]     = tv.bat_status;
+  doc["sol_status"]     = tv.sol_status;
+  doc["iq_status"]      = tv.iq_status;
+  doc["uptime"]         = tv.uptime_s;
+
+  char buf[512];
+  size_t len = serializeJson(doc, buf, sizeof(buf));
+  if (len > 0) {
+    const char* topic = (appConfig.tb_topic[0] != '\0') ? appConfig.tb_topic : TB_MQTT_TOPIC_TELEMETRY;
+    bool ok = tbMqtt.publish(topic, buf);
+    Serial.printf("[TB  ] Telemetry sent (%u B) [%s]\n", (unsigned)len, ok ? "OK" : "FAILED");
+    if (!ok) {
+      Serial.printf("[TB  ] Publish failed, payload: %s\n", buf);
+    }
+  }
+}
+
+static void tbMqttTask(void *arg) {
+  Serial.println("[TB  ] task started (core 0), waiting for WiFi...");
+  tbMqtt.setServer(appConfig.tb_host, appConfig.tb_port);
+  tbMqtt.setBufferSize(1024);
+
+  uint32_t lastPubMs = 0;
+  uint32_t lastConnectAttemptMs = 0;
+  bool attrSent = false;
+  bool initialIqairSent = false;
+
+  for (;;) {
+    setupWebTick();   // Run Web UI + Captive Portal DNS on Core 0
+
+    if (g_tbChanged) {
+      g_tbChanged = false;
+      Serial.printf("[TB  ] Cloud config updated -> reconnecting to %s:%u...\n",
+                    appConfig.tb_host, appConfig.tb_port);
+      tbMqtt.disconnect();
+      tbMqtt.setServer(appConfig.tb_host, appConfig.tb_port);
+      attrSent = false;
+      initialIqairSent = false;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      attrSent = false;
+      initialIqairSent = false;
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    uint32_t now = millis();
+
+    if (!tbMqtt.connected()) {
+      attrSent = false;
+      initialIqairSent = false;
+      if (now - lastConnectAttemptMs >= 5000 || lastConnectAttemptMs == 0) {
+        lastConnectAttemptMs = now;
+        Serial.printf("[TB  ] Connecting to %s:%d...\n", appConfig.tb_host, appConfig.tb_port);
+        const char* activeDevId = (appConfig.dev_name[0] != '\0') ? appConfig.dev_name : DEVICE_ID;
+        if (tbMqtt.connect(activeDevId, appConfig.tb_token, nullptr)) {
+          Serial.println("[TB  ] Connected to ThingsBoard!");
+          TelemetryValues tv = getValue();
+          if (tv.uptime_s > 0) {
+            tbPublishAttributes(tv);
+            attrSent = true;
+          }
+        } else {
+          Serial.printf("[TB  ] Connection failed, rc=%d (retry in 5s)\n", tbMqtt.state());
+        }
+      }
+    } else {
+      tbMqtt.loop();
+
+      if (!attrSent) {
+        TelemetryValues tv = getValue();
+        if (tv.uptime_s > 0) {
+          tbPublishAttributes(tv);
+          attrSent = true;
+        }
+      }
+
+      // If new IQAir data was just fetched, or first connect with valid data -> send separate IQAir telemetry
+      if (g_newIqairReady || !initialIqairSent) {
+        IQAirData iq;
+        if (iqairSnapshot(iq) && iq.valid) {
+          g_newIqairReady = false;
+          initialIqairSent = true;
+          tbPublishIQAir(iq);
+        }
+      }
+
+      uint32_t intervalMs = (appConfig.tb_interval > 0 ? appConfig.tb_interval : 15) * 1000UL;
+      if (now - lastPubMs >= intervalMs || lastPubMs == 0) {
+        TelemetryValues tv = getValue();
+        if (tv.uptime_s > 0) {
+          lastPubMs = now;
+          tbPublishTelemetry(tv);
+        }
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+static void thingsboardBegin() {
+  xTaskCreatePinnedToCore(tbMqttTask, "tb_mqtt", TB_TASK_STACK, nullptr,
+                          1, &tbTaskHandle, TB_TASK_CORE);
+}
+
 
 // ---- Stage 6: SoC coulomb-counting integration --------------------------------
 // Called at the end of every report round (~5.6 s). Integrates net current
@@ -933,8 +1139,8 @@ static void finishReport() {
   float a1Mean, a1Pp, a3Mean, a3Pp;
   acc[1].computeTrimmed(CUR_TRIM_PCT, a1Mean, a1Pp);
   acc[3].computeTrimmed(CUR_TRIM_PCT, a3Mean, a3Pp);
-  float chgA = (a1Mean - vZero[1]) / vPerA * CUR_SIGN_FLIP;
-  float disA = (a3Mean - vZero[3]) / vPerA * CUR_SIGN_FLIP;
+  float chgA = (a1Mean - vZero[1]) / vPerA * CUR_SIGN_FLIP_CHG;
+  float disA = (a3Mean - vZero[3]) / vPerA * CUR_SIGN_FLIP_DIS;
   float vBatt = acc[2].mean() * voltGain[2];
   float netA  = chgA - disA;
   Serial.printf(
@@ -963,8 +1169,8 @@ static void finishReport() {
   // Stage 4: feed the 1-minute logging aggregator with this round's means.
   logAgg.add(acc[0].mean() * voltGain[0],
              vBatt,
-             (a1Mean - vZero[1]) / vPerA * 1000.0f * CUR_SIGN_FLIP,
-             (a3Mean - vZero[3]) / vPerA * 1000.0f * CUR_SIGN_FLIP);
+             (a1Mean - vZero[1]) / vPerA * 1000.0f * CUR_SIGN_FLIP_CHG,
+             (a3Mean - vZero[3]) / vPerA * 1000.0f * CUR_SIGN_FLIP_DIS);
   // Stage 6: integrate SoC from this round's net current (coulomb counting).
   // Runs on core 1 (here) but is pure float math - microseconds, no I/O.
   serviceSoC(vBatt, netA);
@@ -1153,7 +1359,8 @@ void setup() {
     startRound(SamplerMode::ZERO);
   }
 
-  wifiNtpBegin();   // WiFi + SNTP in the background; polled in serviceNetwork()
+  setupWebBegin(); // SoftAP + Web UI portal (loads NVS config, starts AP)
+  wifiNtpBegin();  // WiFi Station + SNTP (connects with NVS config)
   fsBegin();        // LittleFS for the periodic CSV logs
 
   // Load last-known SoC from NVS (coulomb counting continues from here). Falls
@@ -1175,7 +1382,8 @@ void setup() {
   Serial.printf("[SoH ] throughput %.1f Ah -> SoH ~%.1f%% (cycle-life %.0f, EOL %g%%)\n",
                 ahThroughput, sohPct, CYCLE_LIFE, END_OF_LIFE_SOH);
 
-  iqairBegin();    // start the core-1 fetch task; fetches after WiFi comes up
+  iqairBegin();    // start the core-0 fetch task; fetches after WiFi comes up
+  thingsboardBegin();  // start the core-0 TB MQTT task
 }
 
 void loop() {

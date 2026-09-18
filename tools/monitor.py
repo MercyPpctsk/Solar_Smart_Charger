@@ -1,19 +1,24 @@
 import time
 import serial
 
-port = 'COM21'
+port = 'COM11'
 ser = serial.Serial()
 ser.port = port
 ser.baudrate = 115200
 ser.timeout = 0.2
-# Terminal-style: DTR asserted so HWCDC streams; RTS low (RTS toggling => download mode)
-ser.dtr = True
-ser.rts = False
 ser.open()
-ser.dtr = True
+# Set both control lines low (inactive)
+ser.dtr = False
 ser.rts = False
+time.sleep(0.1)
 
-print(f'--- Continuously reading {port} (DTR=1,RTS=0) [Press Ctrl+C to stop] ---\n')
+# Quick reset pulse on EN to restart firmware and capture boot logs
+ser.rts = True
+time.sleep(0.1)
+ser.rts = False
+time.sleep(0.1)
+
+print(f'--- Continuously reading {port} [Press Ctrl+C to stop] ---\n')
 
 buffer = b''
 
@@ -27,7 +32,7 @@ try:
                 line, buffer = buffer.split(b'\n', 1)
                 text = line.decode('utf-8', 'replace').strip()
                 if text:
-                    print(text)
+                    print(text, flush=True)
         else:
             time.sleep(0.02)
 
