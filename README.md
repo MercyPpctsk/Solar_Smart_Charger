@@ -25,16 +25,16 @@
 ```
 ┌─────────────┐    ┌──────────────────────────────┐    ┌──────────┐
 │ แผงโซลาร์    │───▶│ ESP32-S3-ETH (ชาร์จเจอร์+มอนิเตอร์)│───▶│ ThingsBoard│
-│ (A0/A1)     │    │  • ADS1115 อ่าน V/I 4 ช่อง      │    │ (MQTT)    │
+│ (A0/A2)     │    │  • ADS1115 อ่าน V/I 4 ช่อง      │    │ (MQTT)    │
 └─────────────┘    │  • SoC coulomb counting        │    └──────────┘
 ┌─────────────┐    │  • SoH (Equivalent Full Cycles)│         ▲
 │ แบต LiFePO4 │───▶│  • IQAir fetch (core 0)        │─────────┘
-│ (A2/A3)     │    │  • CSV logging (LittleFS)      │
+│ (A1/A3)     │    │  • CSV logging (LittleFS)      │
 └─────────────┘    └──────────────────────────────┘
 ```
 
 **หน้าที่หลัก**
-- อ่านแรงดัน/กระแส 4 ช่องผ่าน **ADS1115** (I²C): แผงโซลาร์ (A0/A1) + แบตเตอรี่ (A2/A3)
+- อ่านแรงดัน/กระแส 4 ช่องผ่าน **ADS1115** (I²C): แผงโซลาร์ (A0/A2) + แบตเตอรี่ (A1/A3)
 - คำนวณ **SoC** (State of Charge) ด้วย **coulomb counting** + สอบเทียบที่ endpoint 3.65V/2.50V (LiFePO4)
 - คำนวณ **SoH** (State of Health) ด้วย **Equivalent Full Cycles** (สะสม |Ah| → แมปลงอายุการใช้งาน)
 - สะสม **energy_in / energy_out** (Wh) รีเซ็ตเที่ยงคืน
@@ -54,13 +54,15 @@
 |---|---|---|
 | Waveshare ESP32-S3-ETH | MCU หลัก + Ethernet (WiFi 2.4GHz) | 16MB Flash, native USB-Serial/JTAG |
 | ADS1115 (16-bit ADC) | วัด V/I 4 ช่อง (A0–A3) | ต่อ I²C |
-| ACS712 ×2 | เซ็นเซอร์กระแส (A1=โซลาร์, A3=โหลด) | สัญญาณ analog เข้า ADS1115 |
+| ACS712 ×2 | เซ็นเซอร์กระแส (A2=ชาร์จเข้าแบต, A3=โหลด) | สัญญาณ analog เข้า ADS1115 |
 | แผงโซลาร์เซลล์ | แหล่งพลังงานชาร์จ | ผ่าน voltage divider เข้า A0 |
-| แบตเตอรี่ LiFePO4 | เก็บพลังงาน | ผ่าน voltage divider เข้า A2 |
+| แบตเตอรี่ LiFePO4 | เก็บพลังงาน | ผ่าน voltage divider เข้า A1 |
 
 ### Voltage divider (ในโค้ด `voltGain[]`)
 - **A0 (โซลาร์): ÷11** (100k/10k) — วัดแรงดันแผงสูง
-- **A2 (แบต): ÷2** — วัดแรงดันแบต
+- **A1 (แบต): ÷2** — วัดแรงดันแบต
+
+> ⚠️ **PCB rev ใหม่:** ช่อง **A1/A2 สลับกัน**จากเลย์เอาต์เดิม — กระแสชาร์จ (ACS712) อยู่ที่ **A2** ส่วน divider แรงดันแบตอยู่ที่ **A1** (ดู `CUR_CH[]`/`VOLT_CH[]`/`voltGain[]` ใน `src/main.cpp`)
 
 > ⚠️ **สำคัญ:** ตอนนี้ทดสอบอยู่บน **1S Li-ion bench cell (~3.3V)** ไม่ใช่ pack 4S จริง ดู `BENCH_1S` ในหัวข้อ [Placeholder](#9-placeholder--to-do-ก่อนลงสนาม)
 
@@ -181,8 +183,8 @@ NVS persist (กันไฟดับ):
 
 | TOR | ฟิลด์ใน struct | ที่มา / สูตร |
 |---|---|---|
-| **3.2.2 Voltage Monitor** | `v_solar`, `v_batt` | ADS1115 A0 (÷11), A2 (÷2) |
-| **3.2.4 Battery Condition** | `i_solar` (charge in), `p_solar` | A1 → `vSolar × chgA` |
+| **3.2.2 Voltage Monitor** | `v_solar`, `v_batt` | ADS1115 A0 (÷11), A1 (÷2) |
+| **3.2.4 Battery Condition** | `i_solar` (charge in), `p_solar` | A2 → `vSolar × chgA` |
 | | `i_load` (discharge out), `p_load` | A3 → `vBatt × disA` |
 | | `soc` | coulomb counting + endpoint recal 3.65V/2.50V |
 | **3.2.5 Battery Health** | `soh` | Equivalent Full Cycles: `EFC = ahThroughput/(2×CAP)` → `SoH = 100 − (EFC/CYCLE_LIFE)×(100−EOL)` |

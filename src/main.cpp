@@ -3,9 +3,11 @@
  * -------------------------------------------------------------------------
  * ADC is on SDA=GPIO1, SCL=GPIO2. Channel roles (NANOTEC solar charger):
  *   A0 = v_solar      solar-cell voltage      (100k/10k divider, ratio 11)
- *   A1 = i_charge     current INTO battery    (ACS712, charging)
- *   A2 = v_batt       battery voltage 1S Li-ion (10k/10k divider, ratio 2)
+ *   A1 = v_batt       battery voltage 1S Li-ion (10k/10k divider, ratio 2)
+ *   A2 = i_charge     current INTO battery    (ACS712, charging)
  *   A3 = i_discharge  current OUT of battery  (ACS712, load/discharge)
+ * NOTE (PCB rev): A1/A2 are SWAPPED vs the older layout. The current-sensor
+ *   on the charge path is now wired to A2, the battery divider to A1.
  *
  * ACS712 current sensors:
  *   - Sensitivity = 100 mV/A @ VCC=5V (RATIOMETRIC: scales with VCC)
@@ -19,9 +21,9 @@
  *   offset (symptom: every reading pinned near 0 mA while current flows).
  *   The one-time boot auto-zero (empty NVS only) is a fallback, never saved.
  *
- * Voltage inputs A0/A2 report pin-voltage * voltGain[] (set the divider ratio
+ * Voltage inputs A0/A1 report pin-voltage * voltGain[] (set the divider ratio
  * there; 1.0 = direct). NEVER feed a pin above (ADS VDD + 0.3V) into the ADC.
- * 1S Li-ion tops out ~4.2V; through the /2 divider that is ~2.1V at A2 - safe.
+ * 1S Li-ion tops out ~4.2V; through the /2 divider that is ~2.1V at A1 - safe.
  *
  * NON-BLOCKING DESIGN (this file):
  *   The original backup (main_adc.cpp.bak) busy-waits through every conversion
@@ -112,10 +114,12 @@ static const uint16_t CUR_BUF_SAMPLES = CH_SAMPLES;
 static const uint8_t  CUR_TRIM_PCT  = 10;
 
 // ---- Channel roles -------------------------------------------------------
-// A1, A3 = ACS712 current sensors ; A0, A2 = voltage inputs.
-//   A1 = i_charge (into battery) ; A3 = i_discharge (out of battery/load)
-static const uint8_t CUR_CH[2]  = {1, 3};   // current-sensor channels
-static const uint8_t VOLT_CH[2] = {0, 2};   // voltage-measurement channels
+// A2, A3 = ACS712 current sensors ; A0, A1 = voltage inputs.
+//   A2 = i_charge (into battery) ; A3 = i_discharge (out of battery/load)
+// (PCB rev: A1/A2 swapped vs the older layout - charge current is on A2,
+//  battery divider on A1. CUR_CH/VOLT_CH/voltGain reflect this wiring.)
+static const uint8_t CUR_CH[2]  = {2, 3};   // current-sensor channels
+static const uint8_t VOLT_CH[2] = {0, 1};   // voltage-measurement channels
 
 // ACS712-20A: 100 mV/A at the nominal 5V supply. Ratiometric, so we scale it
 // by the measured VCC (VCC = 2 * zero-current output) during calibration.
@@ -125,26 +129,26 @@ static const float ACS712_VCC_NOMINAL   = 5.0f;
 // Voltage-input scaling: report Vin = Vadc * ratio, where ratio is the
 // resistor-divider factor (R_top+R_bot)/R_bot. Index by ADC channel 0..3.
 //   A0 = v_solar via 100k(top)/10k(bottom) divider -> ratio 11.0 (~1.6V @ 18V)
-//   A2 = v_batt (1S Li-ion) via 10k/10k divider    -> ratio 2.0  (2.1V @ 4.2V)
+//   A1 = v_batt (1S Li-ion) via 10k/10k divider    -> ratio 2.0  (2.1V @ 4.2V)
 // WIRING: R_top in series from the source (+), R_bot to GND. NEVER swap them.
 static const float VDIV_RATIO_SOLAR = (100000.0f + 10000.0f) / 10000.0f;  // = 11.0
 static const float VDIV_RATIO_BATT  = ( 10000.0f + 10000.0f) / 10000.0f;  // = 2.0
-static float voltGain[4] = {VDIV_RATIO_SOLAR, 1.0f, VDIV_RATIO_BATT, 1.0f};
-//                           A0=/11 solar      A1   A2=/2 batt        A3
+static float voltGain[4] = {VDIV_RATIO_SOLAR, VDIV_RATIO_BATT, 1.0f, 1.0f};
+//                           A0=/11 solar      A1=/2 batt         A2   A3
 
 // Auto-calibrated (assumes no current at cal time). Indexed by ADC channel:
 static float vZero[4] = {2.5f, 2.5f, 2.5f, 2.5f};  // per-channel zero voltage
 static float vPerA    = 0.100f;                    // ACS712 sensitivity (V/A)
 
 // Direction sign: bench wiring drives Vout BELOW the zero point for current
-// flowing in the labelled positive direction (A1 = INTO battery, A3 = OUT to
+// flowing in the labelled positive direction (A2 = INTO battery, A3 = OUT to
 // load), so raw readings come out NEGATIVE while charging/discharging. Flip
 // them so +Chg = charging and +Dis = load current. With the current wiring
-// (verified 2026-09-15: raw A1 rises ABOVE its zero point while charging),
-// the physical polarity is already correct, so NO flip is applied. Set to
-// -1.0f only if the sensors are ever physically re-oriented.
+// (verified 2026-09-15: raw charge ch rises ABOVE its zero point while
+// charging), the physical polarity is already correct, so NO flip is applied
+// for Chg. Set to -1.0f only if the sensors are ever physically re-oriented.
 // Direction sign:
-//   A1 (Charge into battery): Vout rises ABOVE zero point -> +1.0f
+//   A2 (Charge into battery): Vout rises ABOVE zero point -> +1.0f
 //   A3 (Discharge to load):   Vout drops BELOW zero point -> -1.0f (flip so +Dis = positive load)
 static const float CUR_SIGN_FLIP_CHG =  1.0f;
 static const float CUR_SIGN_FLIP_DIS = -1.0f;
@@ -156,7 +160,10 @@ static const float CUR_SIGN_FLIP_DIS = -1.0f;
 // the offset (that pinned all readings near 0 mA while current flowed).
 static Preferences prefs;
 static const char *PREFS_NS  = "solarcal";
-static const char *KEY_VZ1   = "vzero1";
+// NVS keys are named by CURRENT ADC channel, so a PCB channel swap cannot
+// reuse a zero stored against the OLD channel role. A2/A3 are the ACS712
+// current channels on the current PCB rev.
+static const char *KEY_VZ2   = "vzero2";
 static const char *KEY_VZ3   = "vzero3";
 static const char *KEY_VPA   = "vperA";
 static const char *KEY_VPA_CAL       = "vperAcal";   // field-cal sensitivity (overrides KEY_VPA)
@@ -164,9 +171,9 @@ static const char *KEY_VPA_CAL_VALID = "vpaCalOk";
 static const char *KEY_VALID = "valid";
 static bool zeroSavePending  = false;   // set by BOOT press, consumed in finishZero()
 
-// Most-recent raw A1/A3 volts (updated every report round). Used by the
-// 'C' field-calibration command: sens = (raw - zero) / measuredAmps.
-static float lastReportA1 = 0.0f, lastReportA3 = 0.0f;
+// Most-recent raw chg(A2)/dis(A3) volts (updated every report round). Used by
+// the 'C' field-calibration command: sens = (raw - zero) / measuredAmps.
+static float lastReportChg = 0.0f, lastReportDis = 0.0f;
 
 #if ENABLE_NETWORK
 // ---- Stage 4a: NTP clock over WiFi (background, polled - never blocks) -----
@@ -890,10 +897,11 @@ static void serviceLogger()  {}
 // Cheap ACS712 modules are frequently mis-labelled (a "20A" board may carry a
 // 30A die, etc), so the datasheet sensitivity can be far from reality. This
 // command lets the user calibrate the TRUE sensitivity against a multimeter:
-//   1) With a KNOWN current I flowing through A1, read that current on a
-//      multimeter wired in series with the ACS712 (e.g. 0.948 A at the battery).
+//   1) With a KNOWN current I flowing through the charge channel (A2), read
+//      that current on a multimeter wired in series with the ACS712
+//      (e.g. 0.948 A at the battery).
 //   2) Send "C<amps>" over serial (e.g. "C0.948").
-//   3) Firmware computes sens = (rawA1 - zeroA1) / I and saves it to NVS; it
+//   3) Firmware computes sens = (rawChg - zeroChg) / I and saves it to NVS; it
 //      overrides the zero-derived sensitivity on every future boot.
 // 'c' clears the field calibration (reverts to the zero-derived sensitivity).
 static void fieldCalSensitivity(float measuredAmps) {
@@ -901,10 +909,10 @@ static void fieldCalSensitivity(float measuredAmps) {
     Serial.println("[CAL ] amps must be > 0 (use the multimeter reading while current flows)");
     return;
   }
-  float dv = lastReportA1 - vZero[1];
+  float dv = lastReportChg - vZero[CUR_CH[0]];
   if (fabsf(dv) < 0.005f) {
-    Serial.printf("[CAL ] raw A1 (%.4f) too close to zero (%.4f) - is current actually flowing?\n",
-                  lastReportA1, vZero[1]);
+    Serial.printf("[CAL ] raw chg ch (%.4f) too close to zero (%.4f) - is current actually flowing?\n",
+                  lastReportChg, vZero[CUR_CH[0]]);
     return;
   }
   float sens = fabsf(dv) / measuredAmps;        // V/A (sign handled by CUR_SIGN_FLIP)
@@ -923,7 +931,7 @@ static void fieldCalSensitivity(float measuredAmps) {
 static void clearFieldCal() {
   prefs.putBool(KEY_VPA_CAL_VALID, false);
   // Recompute the zero-derived sensitivity so the live value reverts at once.
-  float vcc = vZero[1] * 2.0f;
+  float vcc = vZero[CUR_CH[0]] * 2.0f;
   vPerA = ACS712_V_PER_A_AT_5V * (vcc / ACS712_VCC_NOMINAL);
   Serial.printf("[CAL ] field calibration CLEARED. sens reverted to %.1f mV/A (from zero).\n",
                 vPerA * 1000.0f);
@@ -989,9 +997,9 @@ static void handleSerialCmd() {
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == 't') {
-      Serial.printf("[ADC ] boot+%lus | A1 zero=%.4f A3 zero=%.4f sens=%.1f mV/A\n",
+      Serial.printf("[ADC ] boot+%lus | chg(A2) zero=%.4f dis(A3) zero=%.4f sens=%.1f mV/A\n",
                     (unsigned long)(millis() / 1000),
-                    vZero[1], vZero[3], vPerA * 1000.0f);
+                    vZero[CUR_CH[0]], vZero[CUR_CH[1]], vPerA * 1000.0f);
     } else if (c == 'C') {
       String s = Serial.readStringUntil('\n');
       s.trim();
@@ -1086,7 +1094,7 @@ static ChanAcc     acc[4];
 static SamplerMode mode = SamplerMode::REPORT;
 static SamplerStep step = SamplerStep::START;
 static const uint8_t SEQ_REPORT[4] = {0, 1, 2, 3};  // round-robin, all ch
-static const uint8_t SEQ_ZERO[2]   = {1, 3};        // current channels only
+static const uint8_t SEQ_ZERO[2]   = {2, 3};        // current channels only (PCB rev: A2/A3)
 static uint8_t  seqIdx       = 0;
 static uint8_t  activeCh     = 0;
 static uint32_t convStartMs  = 0;
@@ -1108,16 +1116,17 @@ static void finishZero() {
   // scale the nominal-5V sensitivity accordingly.
   float vcc = vZero[CUR_CH[0]] * 2.0f;
   vPerA = ACS712_V_PER_A_AT_5V * (vcc / ACS712_VCC_NOMINAL);
-  Serial.printf("Zero A1=%.4f V, A3=%.4f V | VCC~=%.2f V | sens=%.1f mV/A\n",
-                vZero[CUR_CH[0]], vZero[CUR_CH[1]], vcc, vPerA * 1000.0f);
+  Serial.printf("Zero chg(A%d)=%.4f V, dis(A%d)=%.4f V | VCC~=%.2f V | sens=%.1f mV/A\n",
+                vZero[CUR_CH[0]], CUR_CH[0], vZero[CUR_CH[1]], CUR_CH[1],
+                vcc, vPerA * 1000.0f);
 
   // Persist ONLY deliberate BOOT-press calibrations. The boot-time fallback
   // zero must not be stored: it may have been captured with current flowing
   // and would then poison every future boot.
   if (zeroSavePending) {
     zeroSavePending = false;
-    prefs.putFloat(KEY_VZ1, vZero[1]);
-    prefs.putFloat(KEY_VZ3, vZero[3]);
+    prefs.putFloat(KEY_VZ2, vZero[CUR_CH[0]]);
+    prefs.putFloat(KEY_VZ3, vZero[CUR_CH[1]]);
     prefs.putFloat(KEY_VPA, vPerA);
     prefs.putBool(KEY_VALID, true);
     Serial.println("Zero SAVED to NVS - reused on every boot until you re-zero again");
@@ -1127,57 +1136,57 @@ static void finishZero() {
 static void finishReport() {
   // Currents shown in AMPERES (like the ACS712 vendor example); 3 decimals
   // keep milliamp-level resolution (0.001 A = 1 mA). pp = peak-to-peak noise.
-  // Raw A1/A3 volts are printed to verify the ACS712 front end: with current
-  // flowing, they must move away from the stored zero point by I*vPerA.
-  // Net = Chg - Dis = current actually entering the battery (compare against
-  // a multimeter placed at the BMS->battery lead, NOT the charger feed).
+  // Raw chg(A2)/dis(A3) volts are printed to verify the ACS712 front end:
+  // with current flowing, they must move away from the stored zero point by
+  // I*vPerA. Net = Chg - Dis = current actually entering the battery (compare
+  // against a multimeter placed at the BMS->battery lead, NOT the charger feed).
   // Trimmed mean for the noisy ACS712 channels rejects transient spikes (e.g.
   // a switching load on A3) that pull the plain mean off the true steady
   // current. Each channel sorts once and we reuse the sorted array for both
   // the mean and the pp. Voltages stay on the plain mean (divider inputs have
   // no spikes).
-  float a1Mean, a1Pp, a3Mean, a3Pp;
-  acc[1].computeTrimmed(CUR_TRIM_PCT, a1Mean, a1Pp);
-  acc[3].computeTrimmed(CUR_TRIM_PCT, a3Mean, a3Pp);
-  float chgA = (a1Mean - vZero[1]) / vPerA * CUR_SIGN_FLIP_CHG;
-  float disA = (a3Mean - vZero[3]) / vPerA * CUR_SIGN_FLIP_DIS;
-  float vBatt = acc[2].mean() * voltGain[2];
+  float chgMean, chgPp, disMean, disPp;
+  acc[CUR_CH[0]].computeTrimmed(CUR_TRIM_PCT, chgMean, chgPp);
+  acc[CUR_CH[1]].computeTrimmed(CUR_TRIM_PCT, disMean, disPp);
+  float chgA = (chgMean - vZero[CUR_CH[0]]) / vPerA * CUR_SIGN_FLIP_CHG;
+  float disA = (disMean - vZero[CUR_CH[1]]) / vPerA * CUR_SIGN_FLIP_DIS;
+  float vBatt = acc[VOLT_CH[1]].mean() * voltGain[VOLT_CH[1]];
   float netA  = chgA - disA;
   Serial.printf(
     "Solar: %6.3f V  Batt: %6.3f V | Chg: %+7.3f A (pp %.3f)  "
-    "Dis: %+7.3f A (pp %.3f) | Net: %+7.3f A | SoC: %5.1f%% | raw A1=%7.4f A3=%7.4f (zero %.4f/%.4f)\n",
-    acc[0].mean() * voltGain[0],
+    "Dis: %+7.3f A (pp %.3f) | Net: %+7.3f A | SoC: %5.1f%% | raw A%d=%7.4f A%d=%7.4f (zero %.4f/%.4f)\n",
+    acc[VOLT_CH[0]].mean() * voltGain[VOLT_CH[0]],
     vBatt,
     chgA,
-    a1Pp / vPerA,
+    chgPp / vPerA,
     disA,
-    a3Pp / vPerA,
+    disPp / vPerA,
     netA,
     socPct,
-    a1Mean,
-    a3Mean,
-    vZero[1],
-    vZero[3]);
+    CUR_CH[0], chgMean,
+    CUR_CH[1], disMean,
+    vZero[CUR_CH[0]],
+    vZero[CUR_CH[1]]);
 
-  // Keep the most recent (trimmed) raw A1/A3 for the 'C' field-cal command,
+  // Keep the most recent (trimmed) raw chg/dis for the 'C' field-cal command,
   // so a calibration taken against a multimeter uses the same spike-free value
   // shown in the report line.
-  lastReportA1 = a1Mean;
-  lastReportA3 = a3Mean;
+  lastReportChg = chgMean;
+  lastReportDis = disMean;
 
 #if ENABLE_NETWORK
   // Stage 4: feed the 1-minute logging aggregator with this round's means.
-  logAgg.add(acc[0].mean() * voltGain[0],
+  logAgg.add(acc[VOLT_CH[0]].mean() * voltGain[VOLT_CH[0]],
              vBatt,
-             (a1Mean - vZero[1]) / vPerA * 1000.0f * CUR_SIGN_FLIP_CHG,
-             (a3Mean - vZero[3]) / vPerA * 1000.0f * CUR_SIGN_FLIP_DIS);
+             (chgMean - vZero[CUR_CH[0]]) / vPerA * 1000.0f * CUR_SIGN_FLIP_CHG,
+             (disMean - vZero[CUR_CH[1]]) / vPerA * 1000.0f * CUR_SIGN_FLIP_DIS);
   // Stage 6: integrate SoC from this round's net current (coulomb counting).
   // Runs on core 1 (here) but is pure float math - microseconds, no I/O.
   serviceSoC(vBatt, netA);
   // Stage 7: compute derived telemetry + cache it for getValue() (MQTT stage).
   // All float math (microseconds, no I/O inside the telemetry lock). The IQAir
   // snapshot is taken and released FIRST so the two mutexes are never nested.
-  float vSolar = acc[0].mean() * voltGain[0];
+  float vSolar = acc[VOLT_CH[0]].mean() * voltGain[VOLT_CH[0]];
   float pSolar = vSolar * chgA;
   float pLoad  = vBatt  * disA;
   serviceEnergy(pSolar, pLoad);
@@ -1298,7 +1307,7 @@ static void handleBootButton() {
   if (raw == stable || millis() - lastChangeMs < 30) return;   // debounce
   stable = raw;
   if (stable == LOW && mode != SamplerMode::ZERO) {
-    Serial.println("Zeroing current channels A1,A3... (loads OFF; result saved to NVS)");
+    Serial.println("Zeroing current channels A2,A3... (loads OFF; result saved to NVS)");
     zeroSavePending = true;
     startRound(SamplerMode::ZERO);
   }
@@ -1308,7 +1317,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);   // boot only: let the USB-CDC port settle before the banner
   Serial.println();
-  Serial.println("=== ESP32-S3-ETH Solar charger: A0=v_solar A1=i_charge A2=v_batt A3=i_discharge ===");
+  Serial.println("=== ESP32-S3-ETH Solar charger: A0=v_solar A1=v_batt A2=i_charge A3=i_discharge ===");
   Serial.printf("ADC 0x%02X @ SDA=%d/SCL=%d | PGA=+/-%.3fV | non-blocking sampler\n",
                 ADS_ADDR, I2C_SDA, I2C_SCL, FS_VOLTS);
   Serial.println("Press BOOT (loads OFF, NO current) to RE-ZERO and save to NVS.");
@@ -1325,15 +1334,15 @@ void setup() {
   prefs.begin(PREFS_NS, false);
   bool haveCal = false;
   if (prefs.getBool(KEY_VALID, false)) {
-    float z1 = prefs.getFloat(KEY_VZ1, 0.0f);
+    float z2 = prefs.getFloat(KEY_VZ2, 0.0f);
     float z3 = prefs.getFloat(KEY_VZ3, 0.0f);
     float pa = prefs.getFloat(KEY_VPA, 0.100f);
     // Plausibility: ACS712 zero sits near VCC/2 (~2.5 V). Sensitivity can be
     // 66 (30A) / 100 (20A) / 185 (5A) mV/A, and a field calibration may land
     // anywhere in between, so accept a wide 40-250 mV/A window here.
-    if (z1 > 2.0f && z1 < 3.0f && z3 > 2.0f && z3 < 3.0f &&
+    if (z2 > 2.0f && z2 < 3.0f && z3 > 2.0f && z3 < 3.0f &&
         pa > 0.040f && pa < 0.250f) {
-      vZero[1] = z1; vZero[3] = z3; vPerA = pa;
+      vZero[CUR_CH[0]] = z2; vZero[CUR_CH[1]] = z3; vPerA = pa;
       haveCal = true;
     }
   }
@@ -1350,8 +1359,8 @@ void setup() {
     }
   }
   if (haveCal) {
-    Serial.printf("Using stored NVS zero: A1=%.4f V, A3=%.4f V, sens=%.1f mV/A%s\n",
-                  vZero[1], vZero[3], vPerA * 1000.0f,
+    Serial.printf("Using stored NVS zero: chg(A%d)=%.4f V, dis(A%d)=%.4f V, sens=%.1f mV/A%s\n",
+                  CUR_CH[0], vZero[CUR_CH[0]], CUR_CH[1], vZero[CUR_CH[1]], vPerA * 1000.0f,
                   haveFieldSens ? "  [FIELD-CAL]" : "");
     startRound(SamplerMode::REPORT);       // calibration done: sample right away
   } else {

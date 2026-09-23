@@ -20,8 +20,16 @@
 #define WIFI_SSID         "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD     "YOUR_WIFI_PASSWORD"
 
-// ThingsBoard MQTT token (unused in this standalone IQAir test)
-#define TB_MQTT_TOKEN     "YOUR_TB_TOKEN"
+// ThingsBoard MQTT connection defaults.
+// NOTE: all of these are OVERRIDDEN by the Web UI config portal (saved to NVS)
+// once the user fills the form at least once. These are the compile-time
+// fallbacks for a fresh NVS.
+#define TB_MQTT_HOST           "YOUR_TB_HOST"      // e.g. "demo.thingsboard.io" or LAN IP
+#define TB_MQTT_PORT           1883
+#define TB_MQTT_TOKEN          "YOUR_TB_TOKEN"
+#define TB_MQTT_TOPIC_TELEMETRY "v1/devices/me/telemetry"
+#define TB_MQTT_TOPIC_ATTRIBUTES "v1/devices/me/attributes"
+#define TB_PUBLISH_INTERVAL_MS 15000UL             // default telemetry cadence (15 s)
 
 // IQAir public station endpoint (no API key required).
 // Use the BASE station endpoint (NO /validated-data suffix): its real-time
