@@ -140,18 +140,28 @@ static float voltGain[4] = {VDIV_RATIO_SOLAR, VDIV_RATIO_BATT, 1.0f, 1.0f};
 static float vZero[4] = {2.5f, 2.5f, 2.5f, 2.5f};  // per-channel zero voltage
 static float vPerA    = 0.100f;                    // ACS712 sensitivity (V/A)
 
-// Direction sign: bench wiring drives Vout BELOW the zero point for current
-// flowing in the labelled positive direction (A2 = INTO battery, A3 = OUT to
-// load), so raw readings come out NEGATIVE while charging/discharging. Flip
-// them so +Chg = charging and +Dis = load current. With the current wiring
-// (verified 2026-09-15: raw charge ch rises ABOVE its zero point while
-// charging), the physical polarity is already correct, so NO flip is applied
-// for Chg. Set to -1.0f only if the sensors are ever physically re-oriented.
+// Direction sign: the ACS712 Vout moves relative to its zero point depending
+// on current direction. We multiply by the sign below so that:
+//   +Chg = current flowing INTO the battery (charging)
+//   +Dis = current flowing OUT to the load (discharging)
+//
+// PCB rev where A1/A2 are swapped (verified 2026-09-23 on the bench):
+//   A2 (Charge into battery): raw Vout rises ABOVE its zero point while
+//        charging  -> (raw - zero) is already positive -> +1.0f (no flip)
+//   A3 (Discharge to load):   raw Vout ALSO rises ABOVE its zero point when a
+//        load draws current (sensor polarity is opposite to the old PCB) ->
+//        (raw - zero) is already positive -> +1.0f (no flip).
+//        NOTE: the previous PCB had A3 dropping BELOW zero under load, which is
+//        why CUR_SIGN_FLIP_DIS used to be -1.0f. Confirmed by live test: with
+//        -1.0f the load current read NEGATIVE, flipping to +1.0f made it read
+//        positive as expected.
+// Set either to -1.0f only if the corresponding sensor is ever physically
+// re-oriented on a future PCB rev.
 // Direction sign:
 //   A2 (Charge into battery): Vout rises ABOVE zero point -> +1.0f
-//   A3 (Discharge to load):   Vout drops BELOW zero point -> -1.0f (flip so +Dis = positive load)
+//   A3 (Discharge to load):   Vout rises ABOVE zero point -> +1.0f
 static const float CUR_SIGN_FLIP_CHG =  1.0f;
-static const float CUR_SIGN_FLIP_DIS = -1.0f;
+static const float CUR_SIGN_FLIP_DIS =  1.0f;
 
 // ---- Stage 2: NVS-persisted zero calibration ------------------------------
 // A zero captured via the BOOT button is stored in NVS and reused across

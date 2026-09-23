@@ -112,7 +112,7 @@
 - **A1 (Charge เข้าแบต)**: กระแสไหลเข้า ทำให้ $V_{out}$ สูงกว่า $V_{zero}$ ($\Delta V > 0$) $\rightarrow$ ตัวคูณ $+1.0$
 - **A3 (Discharge จ่ายโหลด)**: กระแสไหลออก ทำให้ $V_{out}$ ดรอปต่ำกว่า $V_{zero}$ ($\Delta V < 0$) $\rightarrow$ หากใช้ตัวคูณเดิม $+1.0$ จะทำให้ค่ากระแสติดลบ
 
-### การแก้ไข:
+### การแก้ไข (PCB rev เดิม):
 แยกตัวคูณทิศทางในโค้ด:
 ```cpp
 static const float CUR_SIGN_FLIP_CHG =  1.0f;  // A1 rises above zero when charging
@@ -121,6 +121,16 @@ static const float CUR_SIGN_FLIP_DIS = -1.0f;  // A3 drops below zero when disch
 - ผลลัพธ์: กระแสโหลด `Dis` และ `i_load` แสดงผลเป็น **ค่าบวก (`+0.90 A`)**
 - สมการ `Net = chgA - disA` คำนวณหักลบกระแสได้อย่างถูกต้อง ($1.68 - 0.90 = \mathbf{+0.78\text{ A}}$)
 - ฟังก์ชัน `deriveBatStatus()` สามารถตรวจจับและเข้าเงื่อนไขสถานะ `"discharging"` ได้อย่างถูกต้อง
+### อัปเดตสำหรับ PCB rev ใหม่ (A1/A2 สลับกัน):
+บน PCB rev ใหม่ มีการสลับช่อง A1↔A2 และทิศทางเซนเซอร์ Discharge กลับด้านจากเดิม:
+- **A2 (Charge เข้าแบต)**: $V_{out}$ ยัง **สูงกว่า** $V_{zero}$ ตอนชาร์จ $\\rightarrow$ ใช้ $+1.0$ (เหมือนเดิม)
+- **A3 (Discharge จ่ายโหลด)**: $V_{out}$ **สูงกว่า** $V_{zero}$ ตอนเปิดโหลด (กลับขั้วจากเดิม) $\\rightarrow$ ใช้ $+1.0$ อีกครั้ง
+
+```cpp
+static const float CUR_SIGN_FLIP_CHG =  1.0f;  // A2 rises above zero when charging
+static const float CUR_SIGN_FLIP_DIS =  1.0f;  // A3 also rises above zero when load draws current (new PCB)
+```
+- ยืนยันด้วยการทดสอบจริง 2026-09-23: ใช้ `-1.0f` เดิมทำให้ Dis ติดลบเวลาเปิดโหลด เปลี่ยนเป็น `+1.0f` แล้วค่ากลับเป็นบวกตามที่คาดไว้
 
 ---
 

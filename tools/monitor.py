@@ -1,7 +1,7 @@
 import time
 import serial
 
-port = 'COM11'
+port = 'COM21'
 ser = serial.Serial()
 ser.port = port
 ser.baudrate = 115200
