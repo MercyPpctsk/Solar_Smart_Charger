@@ -298,6 +298,7 @@ ESP32-S3-ETH/
 │   ├── monitor.py          # serial monitor helper
 │   ├── cmd_test.py         # ทดสอบคำสั่ง serial
 │   ├── banner.py
+│   ├── serial_logger.py    # บันทึก serial ลง serial_log.txt พร้อม timestamp (ไม่รีเซ็ตบอร์ด)
 │   └── iqair/
 │       ├── config.py
 │       └── iqair_client.py # Python reference ของ IQAir client

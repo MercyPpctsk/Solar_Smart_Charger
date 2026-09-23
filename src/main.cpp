@@ -1160,6 +1160,16 @@ static void finishReport() {
   acc[CUR_CH[1]].computeTrimmed(CUR_TRIM_PCT, disMean, disPp);
   float chgA = (chgMean - vZero[CUR_CH[0]]) / vPerA * CUR_SIGN_FLIP_CHG;
   float disA = (disMean - vZero[CUR_CH[1]]) / vPerA * CUR_SIGN_FLIP_DIS;
+  // Clamp negatives to zero. Readings a few mA BELOW the stored zero point are
+  // ACS712 offset noise (pp ~0.1 A), and a large negative Chg at night is
+  // reverse current (battery -> dark panel) on a board without a blocking
+  // diode - report "no current" instead of a misleading negative. Everything
+  // downstream (Net/SoC, energy, SoH, telemetry, CSV log) uses the clamped
+  // values. The raw chg/dis VOLTS in the report line stay unclamped for
+  // diagnostics, and the BOOT re-zero uses the raw means (lastReportChg/Dis),
+  // so this clamp never affects calibration.
+  if (chgA < 0.0f) chgA = 0.0f;
+  if (disA < 0.0f) disA = 0.0f;
   float vBatt = acc[VOLT_CH[1]].mean() * voltGain[VOLT_CH[1]];
   float netA  = chgA - disA;
   Serial.printf(
@@ -1186,10 +1196,12 @@ static void finishReport() {
 
 #if ENABLE_NETWORK
   // Stage 4: feed the 1-minute logging aggregator with this round's means.
+  // Currents reuse the clamped chgA/disA (mA) so the CSV log, MQTT telemetry
+  // and SoC/energy integration all see the SAME value.
   logAgg.add(acc[VOLT_CH[0]].mean() * voltGain[VOLT_CH[0]],
              vBatt,
-             (chgMean - vZero[CUR_CH[0]]) / vPerA * 1000.0f * CUR_SIGN_FLIP_CHG,
-             (disMean - vZero[CUR_CH[1]]) / vPerA * 1000.0f * CUR_SIGN_FLIP_DIS);
+             chgA * 1000.0f,
+             disA * 1000.0f);
   // Stage 6: integrate SoC from this round's net current (coulomb counting).
   // Runs on core 1 (here) but is pure float math - microseconds, no I/O.
   serviceSoC(vBatt, netA);

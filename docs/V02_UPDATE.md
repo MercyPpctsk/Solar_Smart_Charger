@@ -132,6 +132,19 @@ static const float CUR_SIGN_FLIP_DIS =  1.0f;  // A3 also rises above zero when 
 ```
 - ยืนยันด้วยการทดสอบจริง 2026-09-23: ใช้ `-1.0f` เดิมทำให้ Dis ติดลบเวลาเปิดโหลด เปลี่ยนเป็น `+1.0f` แล้วค่ากลับเป็นบวกตามที่คาดไว้
 
+### Clamp ค่ากระแสติดลบเป็นศูนย์ (2026-09-23)
+
+หลังจากแก้ทิศทางเซนเซอร์แล้ว ยังพบค่าติดลบขนาดเล็กจาก noise รอบจุด zero เช่น `Chg: -0.001 A` หรือ `Dis: -0.029 A` เมื่อไม่มีกระแสจริง และใน log ระยะยาว (1 ชม.) เคยพบ reverse current ขนาด `-0.45 A` ตอนกลางคืน (แบตไหลย้อนกลับเข้าแผงมืด — บอร์ดนี้ไม่มี blocking diode) ซึ่งทำให้ Telemetry และ SoC ผิดเพี้ยน
+
+การแก้ไข: clamp ค่าติดลบเป็นศูนย์ทันทีหลังคำนวณกระแส ก่อนส่งต่อไปยังทุกส่วน:
+```cpp
+if (chgA < 0.0f) chgA = 0.0f;   // noise รอบ zero / reverse current กลางคืน
+if (disA < 0.0f) disA = 0.0f;
+```
+- ครอบคลุมทุกช่องทาง: `Net`, SoC/Energy/SoH integration, MQTT Telemetry (`i_solar`, `i_load`) และ CSV log ใช้ค่า clamped ชุดเดียวกัน (`logAgg.add()` ถูกเปลี่ยนให้ใช้ `chgA`/`disA` แทนการคำนวณใหม่จาก raw)
+- **ไม่กระทบการสอบเทียบ**: ค่า raw volts ใน serial report (`raw A2= ... A3= ...`) และการ re-zero ด้วยปุ่ม BOOT ยังใช้ค่าดิบไม่ถูก clamp
+- ผลทดสอบจริง 2026-09-23: ก่อน clamp เห็น `Chg: -0.001 A, Dis: -0.029 A` หลัง clamp เห็น `Chg: +0.000/+0.001 A, Dis: +0.000 A` เสมอ
+
 ---
 
 ## 6. สถาปัตยกรรมแบ่งคอร์ (Core 0 vs Core 1 Separation)
