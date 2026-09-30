@@ -183,3 +183,48 @@ Solar: 19.297 V  Batt:  3.453 V | Chg:  +1.676 A (pp 0.345)  Dis:  +0.900 A (pp 
 ```
 
 บันทึก ณ วันที่ 17 กันยายน 2026 โดย AI Assistant
+
+---
+
+## 8. อัปเดต 2026-09-30 — Voltage Offset Calibration + Daily Auto-Restart
+
+### 8.1 Daily auto-restart ที่ 00:01 น.
+เพิ่ม `serviceDailyRestart()` เพื่อรีบูตบอร์ดอัตโนมัติทุกวันเวลา 00:01 น. (เวลาท้องถิ่น หลัง NTP sync) เพื่อความเสถียรระยะยาว
+- ตรวจจับโดยเก็บ `lastRestartDay` (จาก `tm.tm_yday`) เทียบทุก 30 วินาทีใน `loop()` (core 1)
+- ไม่ใช้ `delay()` → ไม่กระทบเส้นทางวัด/telemetry 11ms
+- ค่า latch โหลดจาก NVS ตอน `setup()` เพื่อกันรีบูตซ้ำในวันเดียวกันหลังไฟตก/ brown-out
+- มี `#else` stub สำหรับ ADC-only build (`ENABLE_NETWORK=0`) เพื่อให้ `setup()`/`loop()` เรียกได้โดยไม่ต้อง `#if` ทุก call site
+
+### 8.2 Voltage offset calibration สำหรับ v_batt และ v_solar
+เพิ่ม offset แบบ additive แก้ความคลาดเคลื่อนระหว่างแรงดันที่ ADC อ่านได้กับค่าจริงจากมัลติมิเตอร์ ทั้งสองช่องวัดแรงดัน:
+
+| ช่อง | ADC | Config default | Serial เซ็ต | Serial เคลียร์ | NVS key |
+|---|---|---|---|---|---|
+| v_batt | A1 | `VBATT_OFFSET_V` | `V<x>` | `v` | `vbOfs` / `vbOfsOk` |
+| v_solar | A0 | `VSOLAR_OFFSET_V` | `P<x>` (P=Panel) | `p` | `vsOfs` / `vsOfsOk` |
+
+**รูปแบบเดียวกับ field-cal sensitivity เดิม** (`C`/`c`): มี default ใน `config.h` เป็น safety net, override ผ่าน serial เก็บ NVS ข้าม reboot, range check `±1.0V` กันค่าขยะ
+
+#### Sign convention (สำคัญ)
+offset ถูก **บวกเข้า**กับแรงดันที่คำนวณจาก ADC หลังคูณ `voltGain[]`:
+- **ADC อ่านต่ำกว่ามัลติมิเตอร์** → ใช้ค่า **บวก** (เช่น `V0.2` / `P0.1`) เพื่อดันขึ้น
+- **ADC อ่านสูงกว่ามัลติมิเตอร์** → ใช้ค่า **ลบ** (เช่น `V-0.2` / `P-0.1`) เพื่อลดลง
+
+#### จุด apply (จุดเดียว → กระจายอัตโนมัติ)
+ทั้งสอง offset ใส่ที่จุดประกาศตัวแปรใน `finishReport()` บรรทัดเดียว แล้วใช้ตัวแปรนั้นทุกที่:
+```cpp
+float vSolar = acc[VOLT_CH[0]].mean() * voltGain[VOLT_CH[0]] + vSolarOffsetV;
+float vBatt  = acc[VOLT_CH[1]].mean() * voltGain[VOLT_CH[1]] + vBattOffsetV;
+```
+→ กระจายไป: Serial print, CSV log, `serviceSoC()` (endpoint recal 3.65V/2.50V), `pSolar = vSolar × chgA`, `pLoad = vBatt × disA`, `telemetry.v_solar`/`v_batt`, `deriveSolStatus(vSolar, ...)`/`deriveBatStatus(..., vBatt, ...)`
+
+> ⚠️ ก่อนหน้านี้ v_solar คำนวณ **inline 3 จุด** (Serial print + logAgg + telemetry) การเพิ่ม offset จึงยกมาประกาศเป็นตัวแปร `vSolar` ก่อน แล้วแทนที่ inline ทั้ง 3 จุดด้วยตัวแปร — ทำให้ใส่ offset ที่จุดเดียวก็พอ
+
+### 8.3 ผลการ build
+```
+RAM:   15.3% (50,128 / 327,680 B)
+Flash: 15.7% (1,027,789 / 6,553,600 B)
+========================= [SUCCESS] =========================
+```
+
+บันทึก ณ วันที่ 30 กันยายน 2026 โดย AI Assistant
