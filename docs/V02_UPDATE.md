@@ -227,4 +227,35 @@ Flash: 15.7% (1,027,789 / 6,553,600 B)
 ========================= [SUCCESS] =========================
 ```
 
+---
+
+## 9. อัปเดต 2026-09-30 — Web UI Calibration & Configurable Periodic Auto-Reboot
+
+เพิ่มแถบตั้งค่าในหน้า Web UI Configuration Portal (`setup_web.h`) เพื่อให้ผู้ใช้สามารถปรับแต่งค่า Voltage Offset และระบบรีบูตอัตโนมัติได้โดยตรงผ่านเบราว์เซอร์:
+
+### 9.1 แท็บใหม่: `⚙️ Calibration & System` (`#tab_cal` / `#panel_cal`)
+1. **Voltage Offset Calibration (`v_solar` & `v_batt`)**:
+   - ช่องกรอก `Solar Panel Voltage Offset (V)` และ `Battery Voltage Offset (V)`
+   - สเต็ป `0.001`, ขอบเขตจำกัด `±1.000 V`
+   - **Hot-Apply**: เมื่อกดบันทึก ค่าจะถูกเซฟลง NVS namespace `"solarcal"` (`vsOfs`, `vbOfs`) และอัปเดตตัวแปรใน RAM ทันทีผ่านแฟล็ก `g_calChanged` **โดยไม่ต้องรีบูตบอร์ด** ทำให้การวัดและส่งขึ้น ThingsBoard มีผลตามค่าชดเชยใหม่ภายใน 5 วินาที
+   - ซิงก์ร่วมกับคำสั่ง Serial `V`/`v`/`P`/`p` แบบ 100% สองทาง
+2. **Automated Maintenance (Periodic Auto-Reboot Control)**:
+   - Checkbox สวิตช์: `Enable Periodic Auto-Reboot` เพื่อเปิดหรือปิดระบบรีบูตอัตโนมัติ
+   - ช่องกรอก: `Reboot Interval (Hours)` กำหนดจำนวนชั่วโมงที่จะให้บอร์ดรีบูตตัวเอง (1 ถึง 720 ชม., ค่าเริ่มต้น 24 ชม.)
+   - บันทึกลง NVS namespace `"app_cfg"` (`rb_en`, `rb_h`)
+   - ปรับ `serviceDailyRestart()` ให้ตรวจสอบตามเงื่อนไข:
+     - หากปิดสวิตช์ (`reboot_en = false`) $\rightarrow$ ไม่มีการรีบูตอัตโนมัติ
+     - หากเปิดและตั้ง 24 ชม. ร่วมกับ NTP sync $\rightarrow$ รีบูตตอน 00:01 น. ตามรอบวัน
+     - หากเปิดและ Uptime ครบตามจำนวนชั่วโมงที่กำหนด $\rightarrow$ ทำการ Flush NVS (SoC, SoH, CSV row) แล้วรีบูต
+3. **การแจ้งเตือนผลการบันทึก**:
+   - เมื่อกดปุ่ม **"Save Calibration & System"** ระบบจะส่ง POST ไปยัง `/save_cal` แล้วรีไดเรกต์กลับมาพร้อมแถบข้อความแจ้งเตือนสีเขียว:
+     `✔ Calibration & System settings saved successfully! Changes are live.`
+
+### 9.2 ผลการ build ล่าสุด
+```
+RAM:   15.3% (50,128 / 327,680 B)
+Flash: 15.8% (1,032,613 / 6,553,600 B)
+========================= [SUCCESS] =========================
+```
+
 บันทึก ณ วันที่ 30 กันยายน 2026 โดย AI Assistant

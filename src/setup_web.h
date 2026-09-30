@@ -25,6 +25,10 @@ struct AppConfig {
   uint32_t tb_interval    = 15;   // seconds
   char iqair_url[160]     = "";
   uint32_t iqair_interval = 30;   // minutes
+  float    vsolar_offset   = 0.0f; // V (-1.0 to +1.0)
+  float    vbatt_offset    = 0.0f; // V (-1.0 to +1.0)
+  bool     reboot_en       = true; // Periodic auto-reboot enabled
+  uint16_t reboot_hours    = 24;   // Hours (1 to 720)
 };
 
 static AppConfig   appConfig;
@@ -33,6 +37,7 @@ static DNSServer   dnsServer;
 static bool        g_wifiChanged   = false;
 static bool        g_tbChanged     = false;
 static bool        g_iqairChanged  = false;
+static bool        g_calChanged    = false;
 static bool        g_rebootPending = false;
 static uint32_t    g_rebootAtMs    = 0;
 
@@ -62,6 +67,9 @@ static void loadAppConfig() {
   uint32_t inv  = prefs.getUInt("tb_int", 0);
   String s_iq   = prefs.getString("iq_url", "");
   uint32_t iq_inv = prefs.getUInt("iq_int", 0);
+  appConfig.reboot_en = prefs.getBool("rb_en", true);
+  uint16_t rb_h = prefs.getUShort("rb_h", 24);
+  appConfig.reboot_hours = (rb_h > 0) ? rb_h : 24;
   prefs.end();
 
   s_dev.trim();
@@ -111,9 +119,25 @@ static void loadAppConfig() {
 
   appConfig.iqair_interval = (iq_inv > 0) ? iq_inv : 30;
 
-  Serial.printf("[CFG ] Loaded: SSID='%s' TB='%s:%u' (int=%us) Token='%s' IQAir='%s' (int=%umin)\n",
+  // Load voltage calibration offsets from "solarcal" namespace (unified with serial V/P commands)
+  Preferences prefsCal;
+  prefsCal.begin("solarcal", true);
+  if (prefsCal.getBool("vsOfsOk", false)) {
+    appConfig.vsolar_offset = prefsCal.getFloat("vsOfs", VSOLAR_OFFSET_V);
+  } else {
+    appConfig.vsolar_offset = VSOLAR_OFFSET_V;
+  }
+  if (prefsCal.getBool("vbOfsOk", false)) {
+    appConfig.vbatt_offset = prefsCal.getFloat("vbOfs", VBATT_OFFSET_V);
+  } else {
+    appConfig.vbatt_offset = VBATT_OFFSET_V;
+  }
+  prefsCal.end();
+
+  Serial.printf("[CFG ] Loaded: SSID='%s' TB='%s:%u' (int=%us) Token='%s' IQAir='%s' (int=%umin) Cal(vs=%+.3fV, vb=%+.3fV) Reboot=%s(%uh)\n",
                 appConfig.wifi_ssid, appConfig.tb_host, appConfig.tb_port,
-                appConfig.tb_interval, appConfig.tb_token, appConfig.iqair_url, appConfig.iqair_interval);
+                appConfig.tb_interval, appConfig.tb_token, appConfig.iqair_url, appConfig.iqair_interval,
+                appConfig.vsolar_offset, appConfig.vbatt_offset, appConfig.reboot_en ? "ON" : "OFF", appConfig.reboot_hours);
 }
 
 static void saveWifiConfig(const char* devName, const char* ssid, const char* pass, bool clearPass) {
@@ -193,6 +217,38 @@ static void saveCloudConfig(const char* host, uint16_t port, const char* token,
                 appConfig.tb_token, appConfig.iqair_url, appConfig.iqair_interval);
 }
 
+static void saveCalConfig(float vSolarOfs, float vBattOfs, bool rebootEn, uint16_t rebootHours) {
+  if (vSolarOfs < -1.0f) vSolarOfs = -1.0f;
+  if (vSolarOfs >  1.0f) vSolarOfs =  1.0f;
+  if (vBattOfs < -1.0f)  vBattOfs = -1.0f;
+  if (vBattOfs >  1.0f)  vBattOfs =  1.0f;
+  if (rebootHours < 1)   rebootHours = 1;
+  if (rebootHours > 720) rebootHours = 720;
+
+  appConfig.vsolar_offset = vSolarOfs;
+  appConfig.vbatt_offset  = vBattOfs;
+  appConfig.reboot_en     = rebootEn;
+  appConfig.reboot_hours  = rebootHours;
+
+  Preferences prefsCal;
+  prefsCal.begin("solarcal", false);
+  prefsCal.putFloat("vsOfs", vSolarOfs);
+  prefsCal.putBool("vsOfsOk", true);
+  prefsCal.putFloat("vbOfs", vBattOfs);
+  prefsCal.putBool("vbOfsOk", true);
+  prefsCal.end();
+
+  Preferences prefsApp;
+  prefsApp.begin("app_cfg", false);
+  prefsApp.putBool("rb_en", rebootEn);
+  prefsApp.putUShort("rb_h", rebootHours);
+  prefsApp.end();
+
+  g_calChanged = true;
+  Serial.printf("[CFG ] Calibration saved: v_solar ofs=%+.3fV, v_batt ofs=%+.3fV, AutoReboot=%s (%uh)\n",
+                vSolarOfs, vBattOfs, rebootEn ? "ON" : "OFF", rebootHours);
+}
+
 // ---- HTML / Web UI rendering -----------------------------------------------
 static String _buildWebPage(const String& savedMsg = "") {
   String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
@@ -247,6 +303,7 @@ static String _buildWebPage(const String& savedMsg = "") {
   html += F("<div class='tabs'>"
             "<button id='tab_wifi' class='tab active' onclick=\"openTab('wifi')\">&#128246; WiFi Settings</button>"
             "<button id='tab_cloud' class='tab' onclick=\"openTab('cloud')\">&#9729; ThingsBoard &amp; IQAir</button>"
+            "<button id='tab_cal' class='tab' onclick=\"openTab('cal')\">&#9881; Calibration &amp; System</button>"
             "</div>");
 
   // Tab 1: WiFi
@@ -308,6 +365,44 @@ static String _buildWebPage(const String& savedMsg = "") {
   html += F("<button type='submit' class='btn warn'>Restart Device</button>");
   html += F("</form></div>");
 
+  // Tab 3: Calibration & System
+  html += F("<div id='panel_cal' class='panel'>");
+  html += F("<form action='/save_cal' method='post'>");
+  html += F("<h3>Voltage Offset Calibration (ADC Trim)</h3>");
+  html += F("<div class='hint' style='margin-bottom:12px;line-height:1.5;'>"
+            "Additive offset in Volts (&plusmn;1.000 V) applied after the voltage divider.<br>"
+            "&bull; If ADC reads <strong>LOWER</strong> than multimeter &rarr; enter <strong>POSITIVE</strong> offset (e.g. +0.150)<br>"
+            "&bull; If ADC reads <strong>HIGHER</strong> than multimeter &rarr; enter <strong>NEGATIVE</strong> offset (e.g. -0.100)<br>"
+            "&bull; <em>Changes take effect immediately without needing to reboot!</em>"
+            "</div>");
+  html += F("<label>Solar Panel Voltage Offset (V) &mdash; A0 Channel</label>");
+  html += "<input type='number' name='vsolar_ofs' step='0.001' min='-1.0' max='1.0' value='" + String(appConfig.vsolar_offset, 3) + "' placeholder='0.000' required>";
+
+  html += F("<label style='margin-top:14px;'>Battery Voltage Offset (V) &mdash; A1 Channel</label>");
+  html += "<input type='number' name='vbatt_ofs' step='0.001' min='-1.0' max='1.0' value='" + String(appConfig.vbatt_offset, 3) + "' placeholder='0.000' required>";
+
+  html += F("<h3 style='margin-top:24px;'>Automated Maintenance (Periodic Reboot)</h3>");
+  html += F("<div class='hint' style='margin-bottom:12px;line-height:1.5;'>"
+            "Periodically restarts the ESP32-S3 to clear memory fragmentation and ensure 24/7 reliability. "
+            "All telemetry, SoC, SoH, and CSV logs are automatically flushed to flash before restarting."
+            "</div>");
+  html += "<label style='display:flex;align-items:center;gap:10px;cursor:pointer;color:#eee;font-size:14px;margin:12px 0 8px;'>"
+          "<input type='checkbox' name='reboot_en' value='1' style='width:auto;min-width:18px;height:18px;cursor:pointer;' "
+          + String(appConfig.reboot_en ? "checked" : "") + ">"
+          "<strong>Enable Periodic Auto-Reboot</strong></label>";
+
+  html += F("<label style='margin-top:10px;'>Reboot Interval (Hours)</label>");
+  html += "<input type='number' name='reboot_h' min='1' max='720' value='" + String(appConfig.reboot_hours) + "' placeholder='24' required>";
+  html += F("<div class='hint'>Interval in hours (e.g. 24 = daily / every 24 hours). Range: 1 to 720 hours.</div>");
+
+  html += F("<button type='submit' class='btn'>Save Calibration &amp; System</button>");
+  html += F("</form>");
+
+  html += F("<h3 style='margin-top:28px;'>Manual System Restart</h3>");
+  html += F("<form action='/reboot' method='post' onsubmit=\"return confirm('Restart ESP32-S3 now?');\">");
+  html += F("<button type='submit' class='btn warn'>Restart Device Now</button>");
+  html += F("</form></div>");
+
   // Tab JS
   html += F("<script>"
             "function openTab(name){"
@@ -331,6 +426,7 @@ static void _handleRoot() {
     String s = webServer.arg("saved");
     if (s == "wifi") saved = "WiFi settings saved! Attempting connection...";
     else if (s == "cloud") saved = "Cloud settings saved successfully!";
+    else if (s == "cal") saved = "Calibration & System settings saved successfully! Changes are live.";
   }
   webServer.send(200, "text/html", _buildWebPage(saved));
 }
@@ -367,6 +463,19 @@ static void _handleSaveCloud() {
   saveCloudConfig(host.c_str(), port, token.c_str(), topic.c_str(), intervalSec, iqUrl.c_str(), iqIntervalMin);
 
   webServer.sendHeader("Location", "/?saved=cloud#cloud");
+  webServer.send(303);
+}
+
+static void _handleSaveCal() {
+  float vSolarOfs = webServer.arg("vsolar_ofs").toFloat();
+  float vBattOfs  = webServer.arg("vbatt_ofs").toFloat();
+  bool  rebootEn  = webServer.hasArg("reboot_en");
+  uint16_t rebootH = (uint16_t)webServer.arg("reboot_h").toInt();
+  if (rebootH == 0) rebootH = 24;
+
+  saveCalConfig(vSolarOfs, vBattOfs, rebootEn, rebootH);
+
+  webServer.sendHeader("Location", "/?saved=cal#cal");
   webServer.send(303);
 }
 
@@ -412,6 +521,7 @@ static void setupWebBegin() {
   webServer.on("/", HTTP_GET, _handleRoot);
   webServer.on("/save_wifi", HTTP_POST, _handleSaveWiFi);
   webServer.on("/save_cloud", HTTP_POST, _handleSaveCloud);
+  webServer.on("/save_cal", HTTP_POST, _handleSaveCal);
   webServer.on("/reboot", HTTP_POST, _handleReboot);
 
   // Captive portal probes from iOS, Android, Windows

@@ -882,15 +882,15 @@ static void serviceLogger() {
   logAgg.reset();
 }
 
-// ---- Stage 9: scheduled daily restart at 00:01 local ------------------------
-// Reboots once a day right after midnight to clear any accumulated drift and
-// start fresh. Three layers guard against a reboot loop:
+// ---- Stage 9: scheduled periodic / daily restart ---------------------------
+// Reboots periodically (configured via Web UI / appConfig) to clear any accumulated
+// drift and start fresh. Layers guard against a reboot loop:
 //   1. NVS day-latch (rstDay): written BEFORE ESP.restart(), so a re-boot that
 //      still lands inside the 00:01 window sees "already done today" and skips.
 //   2. Uptime gate (5 min): a freshly powered board never restarts right away,
 //      regardless of the clock.
-//   3. ntpSynced check + 00:01-00:59 window: no real time -> no restart.
-// NVS wear is one int write per day (negligible).
+//   3. User toggle: appConfig.reboot_en must be true.
+// NVS wear is one int write per reboot (negligible).
 static const uint8_t  RST_HOUR          = 0;                    // 00:01 local (ICT)
 static const uint8_t  RST_MIN           = 1;
 static const uint32_t RST_MIN_UPTIME_MS = 5UL * 60UL * 1000UL;  // anti boot-loop
@@ -898,24 +898,37 @@ static const char    *KEY_RST_DAY       = "rstDay";             // NVS day latch
 static int            restartLatch      = -1;   // (year*1000 + yday), survives reboot
 
 static void serviceDailyRestart() {
-  if (!ntpSynced) return;                       // no real clock -> never restart
+  if (!appConfig.reboot_en) return;             // user disabled auto-reboot
+
   static uint32_t lastMs = 0;                   // check at ~1 Hz (like serviceNetwork)
   if (millis() - lastMs < 1000) return;
   lastMs = millis();
   if (millis() < RST_MIN_UPTIME_MS) return;     // just booted -> never restart
 
-  time_t t = time(nullptr);
-  struct tm tv; localtime_r(&t, &tv);
-  int today = (tv.tm_year + 1900) * 1000 + tv.tm_yday;  // unique per calendar day
-  if (today == restartLatch) return;            // already restarted today
+  bool shouldRestart = false;
 
-  // Catch window 00:01:00-00:59:59 (absorbs a slow NTP sync after boot).
-  if (tv.tm_hour != RST_HOUR || tv.tm_min < RST_MIN) return;
+  // Case 1: If 24 hours and NTP synced, align cleanly with 00:01 local midnight
+  if (appConfig.reboot_hours == 24 && ntpSynced) {
+    time_t t = time(nullptr);
+    struct tm tv; localtime_r(&t, &tv);
+    int today = (tv.tm_year + 1900) * 1000 + tv.tm_yday;  // unique per calendar day
+    if (today != restartLatch && tv.tm_hour == RST_HOUR && tv.tm_min >= RST_MIN) {
+      restartLatch = today;
+      prefs.putInt(KEY_RST_DAY, today);         // latch FIRST (anti loop)
+      shouldRestart = true;
+    }
+  }
 
-  Serial.printf("[SYS ] daily restart @ %02d:%02d - flushing NVS before reboot...\n",
-                tv.tm_hour, tv.tm_min);
-  restartLatch = today;
-  prefs.putInt(KEY_RST_DAY, today);             // latch FIRST (anti loop)
+  // Case 2: Elapsed uptime in hours >= reboot_hours
+  uint64_t targetUptimeMs = (uint64_t)appConfig.reboot_hours * 3600000ULL;
+  if ((uint64_t)millis() >= targetUptimeMs) {
+    shouldRestart = true;
+  }
+
+  if (!shouldRestart) return;
+
+  Serial.printf("[SYS ] scheduled restart (interval %u hrs) - flushing NVS before reboot...\n",
+                appConfig.reboot_hours);
   prefs.putFloat(KEY_SOC, socPct);              // flush SoC (normally every 5 min)
   prefs.putDouble(KEY_AH_TP, ahThroughput);     // flush SoH throughput (hourly)
   writeLogLine();                               // commit any pending CSV row
@@ -1020,6 +1033,9 @@ static void setVbattOffset(float v) {
   if (v < -1.0f) v = -1.0f;
   if (v >  1.0f) v =  1.0f;
   vBattOffsetV = v;
+#if ENABLE_NETWORK
+  appConfig.vbatt_offset = v;
+#endif
   prefs.putFloat(KEY_VBATT_OFFSET, v);
   prefs.putBool(KEY_VBATT_OFFSET_VALID, true);
   Serial.printf("[CAL ] v_batt offset SAVED: %+.3f V (default %.3f). v_batt now uses this value.\n",
@@ -1029,6 +1045,9 @@ static void setVbattOffset(float v) {
 static void clearVbattOffset() {
   prefs.putBool(KEY_VBATT_OFFSET_VALID, false);
   vBattOffsetV = VBATT_OFFSET_V;
+#if ENABLE_NETWORK
+  appConfig.vbatt_offset = VBATT_OFFSET_V;
+#endif
   Serial.printf("[CAL ] v_batt offset CLEARED. reverted to compile-time default %+.3f V.\n",
                 (float)VBATT_OFFSET_V);
 }
@@ -1042,6 +1061,9 @@ static void setVsolarOffset(float v) {
   if (v < -1.0f) v = -1.0f;
   if (v >  1.0f) v =  1.0f;
   vSolarOffsetV = v;
+#if ENABLE_NETWORK
+  appConfig.vsolar_offset = v;
+#endif
   prefs.putFloat(KEY_VSOLAR_OFFSET, v);
   prefs.putBool(KEY_VSOLAR_OFFSET_VALID, true);
   Serial.printf("[CAL ] v_solar offset SAVED: %+.3f V (default %.3f). v_solar now uses this value.\n",
@@ -1051,6 +1073,9 @@ static void setVsolarOffset(float v) {
 static void clearVsolarOffset() {
   prefs.putBool(KEY_VSOLAR_OFFSET_VALID, false);
   vSolarOffsetV = VSOLAR_OFFSET_V;
+#if ENABLE_NETWORK
+  appConfig.vsolar_offset = VSOLAR_OFFSET_V;
+#endif
   Serial.printf("[CAL ] v_solar offset CLEARED. reverted to compile-time default %+.3f V.\n",
                 (float)VSOLAR_OFFSET_V);
 }
@@ -1561,6 +1586,10 @@ void setup() {
   }
 
   setupWebBegin(); // SoftAP + Web UI portal (loads NVS config, starts AP)
+#if ENABLE_NETWORK
+  vSolarOffsetV = appConfig.vsolar_offset;
+  vBattOffsetV  = appConfig.vbatt_offset;
+#endif
   wifiNtpBegin();  // WiFi Station + SNTP (connects with NVS config)
   fsBegin();        // LittleFS for the periodic CSV logs
 
@@ -1580,7 +1609,15 @@ void setup() {
   ahLastMs = 0;    // serviceSoH() will stamp on its first call
   sohSaveMs = millis();
   restartLatch = prefs.getInt(KEY_RST_DAY, -1);   // daily-restart day latch (Stage 9)
+#if ENABLE_NETWORK
+  if (appConfig.reboot_en) {
+    Serial.printf("[SYS ] periodic restart armed: every %u hrs (en=ON)\n", appConfig.reboot_hours);
+  } else {
+    Serial.println("[SYS ] periodic restart is DISABLED");
+  }
+#else
   Serial.printf("[SYS ] daily restart armed at %02d:%02d local\n", RST_HOUR, RST_MIN);
+#endif
   telemetryMutex = xSemaphoreCreateMutex();
   Serial.printf("[SoH ] throughput %.1f Ah -> SoH ~%.1f%% (cycle-life %.0f, EOL %g%%)\n",
                 ahThroughput, sohPct, CYCLE_LIFE, END_OF_LIFE_SOH);
@@ -1592,6 +1629,15 @@ void setup() {
 void loop() {
   handleBootButton();
   handleSerialCmd();
+#if ENABLE_NETWORK
+  if (g_calChanged) {
+    g_calChanged = false;
+    vSolarOffsetV = appConfig.vsolar_offset;
+    vBattOffsetV  = appConfig.vbatt_offset;
+    Serial.printf("[CAL ] Live offsets updated from Web UI: solar=%+.3fV, batt=%+.3fV\n",
+                  vSolarOffsetV, vBattOffsetV);
+  }
+#endif
   runSampler();
   serviceNetwork();
   serviceLogger();
