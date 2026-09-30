@@ -117,11 +117,11 @@ pio device monitor         # เปิด serial monitor 115200
 pio run -t upload && pio device monitor
 ```
 
-### ขนาด firmware (หลัง Stage 7)
+### ขนาด firmware (หลัง Stage 9: auto-restart + voltage offset calibration)
 | | ใช้ไป | จากทั้งหมด | % |
 |---|---|---|---|
-| **RAM** | 48,600 B | 327,680 B | 14.8% |
-| **Flash** | 961,141 B | 6,553,600 B | 14.7% |
+| **RAM** | 50,128 B | 327,680 B | 15.3% |
+| **Flash** | 1,027,789 B | 6,553,600 B | 15.7% |
 
 ---
 
@@ -138,8 +138,14 @@ pio run -t upload && pio device monitor
 | `S<%>` | ตั้ง SoC ด้วยมือ เช่น `S90` → 90% (เซฟ NVS) |
 | `C<ค่า>` | field-calibrate sensitivity ของ ACS712 |
 | `c` | ล้าง field calibration |
+| `V<volts>` | ตั้ง **v_batt offset** (ช่อง A1) — ค่า additive แก้ความคลาดเคลื่อน ADC vs มัลติมิเตอร์ เช่น `V0.2` (ADC อ่านต่ำ → บวก) หรือ `V-0.2` (ADC อ่านสูง → ลบ) เซฟ NVS ข้าม reboot |
+| `v` | ล้าง v_batt offset → กลับใช้ค่า default `VBATT_OFFSET_V` ใน `config.h` |
+| `P<volts>` | ตั้ง **v_solar offset** (ช่อง A0, P = Panel) — หลักการเดียวกับ `V` แต่สำหรับแรงดันแผง เช่น `P0.1` / `P-0.1` เซฟ NVS |
+| `p` | ล้าง v_solar offset → กลับใช้ค่า default `VSOLAR_OFFSET_V` ใน `config.h` |
 | กดปุ่ม **BOOT** | ทำ auto-zero ของ ACS712 (ต้องไม่มีกระแสผ่าน A1/A3 ขณะกด) |
 ---
+
+> **หมายเหตุ voltage offset (`V`/`v`/`P`/`p`):** ค่า offset ถูกบวกเข้ากับแรงดันที่คำนวณจาก ADC **หลัง** คูณ `voltGain[]` ที่จุดเดียวใน `finishReport()` แล้วกระจายไปทุกจุดใช้งานอัตโนมัติ (Serial, CSV, SoC endpoint recal, p_solar/p_load, telemetry) มี range check `±1.0V` กันค่าขยะจาก NVS ที่เสีย ค่า default อยู่ใน `config.h` (`VBATT_OFFSET_V`/`VSOLAR_OFFSET_V`) เป็น safety net เมื่อ NVS ถูก wipe — ปรับต่อเครื่องได้โดยไม่ต้อง reflash
 
 ## 6. Data Flow / วงจรข้อมูล
 
@@ -164,9 +170,10 @@ NVS persist (กันไฟดับ):
   - SoC: ทุก 5 นาที (KEY_SOC)
   - SoH throughput: ทุก 1 ชั่วโมง (KEY_AH_TP = "ahTp")
   - Auto-zero / field-cal: ทันทีเมื่อสั่ง
+  - Voltage offset (v_batt/v_solar): ทันทีเมื่อสั่ง V/v/P/p (KEY_VBATT_OFFSET/KEY_VSOLAR_OFFSET)
 
-อนาคต (core 0, MQTT task):
-  - getValue() อ่าน `telemetry` snapshot (bounded 10ms timeout) → publish ขึ้น ThingsBoard
+ทุกวัน 00:01 (core 1, เมื่อ NTP sync):
+  - serviceDailyRestart() → ESP.restart() (รีบูตเพื่อความเสถียรระยะยาว)
 ```
 
 ### การป้องกัน deadlock / blocking (สำคัญ)
@@ -281,6 +288,17 @@ if (tv.uptime_s == 0) return;   // snapshot ยังไม่พร้อม (s
 **ยังไม่ได้ทำ (เปิดไว้สำหรับขั้นตอนถัดไป):**
 - ❌ MQTT client + publish loop (ดูหัวข้อ 8)
 - ❌ Light sleep (ประหยัดพลังงานระหว่างรอบวัด)
+
+### การปรับเทียบแรงดัน (voltage offset calibration) — 2026-09-30
+`v_batt` (A1) และ `v_solar` (A0) มีค่า offset แบบ additive แก้ความคลาดเคลื่อนระหว่าง ADC กับมัลติมิเตอร์:
+- **Default compile-time**: `VBATT_OFFSET_V` / `VSOLAR_OFFSET_V` ใน `config.h` (ค่าตั้งต้น `0.0f`)
+- **Runtime override (NVS)**: คำสั่ง serial `V<x>`/`P<x>` (เซ็ต) และ `v`/`p` (เคลียร์) — ปรับต่อเครื่องได้โดยไม่ reflash
+- **Sign convention**: offset บวกเข้ากับ ADC-derived voltage — ADC อ่านต่ำกว่าจริง → ใช้ค่าบวก; อ่านสูงกว่าจริง → ใช้ค่าลบ
+- **Safety net**: NVS ถูก wipe → กลับใช้ default config.h; NVS float เสีย → range check `±1.0V` ปฏิเสธ + แจ้ง serial
+- ใส่ที่จุดคำนวณเดียวใน `finishReport()` → กระจายไป Serial/CSV/SoC/p_solar/p_load/telemetry อัตโนมัติ
+
+### Daily auto-restart (00:01) — 2026-09-30
+`serviceDailyRestart()` รีบูตบอร์ดทุกวันเวลา 00:01 น. ท้องถิ่น (เมื่อ NTP sync แล้ว) เพื่อความเสถียรระยะยาว ตรวจจับโดยเก็บ `lastRestartDay` จาก `tm.tm_yday` ทุก 30 วินาทีใน `loop()` (core 1) — ไม่ใช้ `delay()` จึงไม่กระทบเส้นทางวัด ค่า latch โหลดจาก NVS ตอน `setup()` เพื่อกันรีบูตซ้ำในวันเดียวกันหลังไฟตก
 ---
 
 ## 10. โครงสร้างโปรเจกต์

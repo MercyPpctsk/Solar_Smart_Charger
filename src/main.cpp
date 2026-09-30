@@ -145,23 +145,25 @@ static float vPerA    = 0.100f;                    // ACS712 sensitivity (V/A)
 //   +Chg = current flowing INTO the battery (charging)
 //   +Dis = current flowing OUT to the load (discharging)
 //
-// PCB rev where A1/A2 are swapped (verified 2026-09-23 on the bench):
-//   A2 (Charge into battery): raw Vout rises ABOVE its zero point while
-//        charging  -> (raw - zero) is already positive -> +1.0f (no flip)
-//   A3 (Discharge to load):   raw Vout ALSO rises ABOVE its zero point when a
-//        load draws current (sensor polarity is opposite to the old PCB) ->
-//        (raw - zero) is already positive -> +1.0f (no flip).
-//        NOTE: the previous PCB had A3 dropping BELOW zero under load, which is
-//        why CUR_SIGN_FLIP_DIS used to be -1.0f. Confirmed by live test: with
-//        -1.0f the load current read NEGATIVE, flipping to +1.0f made it read
-//        positive as expected.
-// Set either to -1.0f only if the corresponding sensor is ever physically
-// re-oriented on a future PCB rev.
-// Direction sign:
+// PCB rev where A1/A2 are swapped. Direction of each ACS712 Vout relative to
+// its zero point was RE-VERIFIED on the bench (2026-09-28) by comparing raw
+// volts with the load OFF (the stored zero) vs the load ON:
+//   A2 (Charge into battery): raw Vout rises ABOVE zero while charging
+//        -> (raw - zero) positive -> +1.0f (no flip)
+//   A3 (Discharge to load):   raw Vout DROPS BELOW zero when a load draws
+//        current (this board's A3 polarity matches the ORIGINAL PCB, NOT the
+//        "new PCB" assumption from commit 550ba14). With +1.0f the computed
+//        current goes NEGATIVE under load and is clamped to 0.000 A by the
+//        noise/reverse-current guard in finishReport() -> the load current
+//        vanishes from telemetry. Flipping to -1.0f makes (raw - zero)*-1
+//        read POSITIVE under load, as expected.
+// Set either to -1.0f only if the corresponding sensor's physical polarity
+// makes (raw - zero) go negative for the labelled current direction.
+// Direction sign (verified 2026-09-28 on this board):
 //   A2 (Charge into battery): Vout rises ABOVE zero point -> +1.0f
-//   A3 (Discharge to load):   Vout rises ABOVE zero point -> +1.0f
+//   A3 (Discharge to load):   Vout drops BELOW zero point -> -1.0f
 static const float CUR_SIGN_FLIP_CHG =  1.0f;
-static const float CUR_SIGN_FLIP_DIS =  1.0f;
+static const float CUR_SIGN_FLIP_DIS = -1.0f;
 
 // ---- Stage 2: NVS-persisted zero calibration ------------------------------
 // A zero captured via the BOOT button is stored in NVS and reused across
@@ -178,7 +180,21 @@ static const char *KEY_VZ3   = "vzero3";
 static const char *KEY_VPA   = "vperA";
 static const char *KEY_VPA_CAL       = "vperAcal";   // field-cal sensitivity (overrides KEY_VPA)
 static const char *KEY_VPA_CAL_VALID = "vpaCalOk";
+static const char *KEY_VBATT_OFFSET        = "vbOfs";   // v_batt additive offset (V), overrides VBATT_OFFSET_V
+static const char *KEY_VBATT_OFFSET_VALID  = "vbOfsOk";
+static const char *KEY_VSOLAR_OFFSET       = "vsOfs";   // v_solar additive offset (V), overrides VSOLAR_OFFSET_V
+static const char *KEY_VSOLAR_OFFSET_VALID = "vsOfsOk";
 static const char *KEY_VALID = "valid";
+// Live v_batt offset in volts. Seeded from VBATT_OFFSET_V (config.h) at boot,
+// then overridden by a valid NVS value if present. Applied additively AFTER
+// the voltGain[] multiply at the single vBatt computation point so every
+// downstream consumer (Serial, CSV, SoC endpoint recal, pLoad, telemetry) sees
+// the corrected value automatically.
+static float vBattOffsetV = VBATT_OFFSET_V;
+// Live v_solar offset in volts. Same scheme as vBattOffsetV but for the A0
+// channel (solar panel voltage). Seeded from VSOLAR_OFFSET_V, overridden by
+// NVS via the 'P<x>'/'p' serial commands.
+static float vSolarOffsetV = VSOLAR_OFFSET_V;
 static bool zeroSavePending  = false;   // set by BOOT press, consumed in finishZero()
 
 // Most-recent raw chg(A2)/dis(A3) volts (updated every report round). Used by
@@ -866,6 +882,48 @@ static void serviceLogger() {
   logAgg.reset();
 }
 
+// ---- Stage 9: scheduled daily restart at 00:01 local ------------------------
+// Reboots once a day right after midnight to clear any accumulated drift and
+// start fresh. Three layers guard against a reboot loop:
+//   1. NVS day-latch (rstDay): written BEFORE ESP.restart(), so a re-boot that
+//      still lands inside the 00:01 window sees "already done today" and skips.
+//   2. Uptime gate (5 min): a freshly powered board never restarts right away,
+//      regardless of the clock.
+//   3. ntpSynced check + 00:01-00:59 window: no real time -> no restart.
+// NVS wear is one int write per day (negligible).
+static const uint8_t  RST_HOUR          = 0;                    // 00:01 local (ICT)
+static const uint8_t  RST_MIN           = 1;
+static const uint32_t RST_MIN_UPTIME_MS = 5UL * 60UL * 1000UL;  // anti boot-loop
+static const char    *KEY_RST_DAY       = "rstDay";             // NVS day latch
+static int            restartLatch      = -1;   // (year*1000 + yday), survives reboot
+
+static void serviceDailyRestart() {
+  if (!ntpSynced) return;                       // no real clock -> never restart
+  static uint32_t lastMs = 0;                   // check at ~1 Hz (like serviceNetwork)
+  if (millis() - lastMs < 1000) return;
+  lastMs = millis();
+  if (millis() < RST_MIN_UPTIME_MS) return;     // just booted -> never restart
+
+  time_t t = time(nullptr);
+  struct tm tv; localtime_r(&t, &tv);
+  int today = (tv.tm_year + 1900) * 1000 + tv.tm_yday;  // unique per calendar day
+  if (today == restartLatch) return;            // already restarted today
+
+  // Catch window 00:01:00-00:59:59 (absorbs a slow NTP sync after boot).
+  if (tv.tm_hour != RST_HOUR || tv.tm_min < RST_MIN) return;
+
+  Serial.printf("[SYS ] daily restart @ %02d:%02d - flushing NVS before reboot...\n",
+                tv.tm_hour, tv.tm_min);
+  restartLatch = today;
+  prefs.putInt(KEY_RST_DAY, today);             // latch FIRST (anti loop)
+  prefs.putFloat(KEY_SOC, socPct);              // flush SoC (normally every 5 min)
+  prefs.putDouble(KEY_AH_TP, ahThroughput);     // flush SoH throughput (hourly)
+  writeLogLine();                               // commit any pending CSV row
+  logAgg.reset();
+  delay(100);                                   // let Serial drain (matches web reboot)
+  ESP.restart();
+}
+
 static void dumpLogTail(size_t lines) {
   if (!fsOk) { Serial.println("[LOG ] FS not mounted"); return; }
   char name[24];
@@ -897,10 +955,11 @@ static void eraseLogs() {
 #else
 // ---- ADC-only build: no WiFi/NTP/FS. Provide no-op stubs so setup()/loop()
 //      can call them unconditionally without #if guards at every call site.
-static void wifiNtpBegin()   {}
-static void serviceNetwork() {}
-static void fsBegin()        {}
-static void serviceLogger()  {}
+static void wifiNtpBegin()        {}
+static void serviceNetwork()      {}
+static void fsBegin()             {}
+static void serviceLogger()       {}
+static void serviceDailyRestart() {}
 #endif // ENABLE_NETWORK
 
 // ---- Field calibration of ACS712 sensitivity (both builds) -----------------
@@ -945,6 +1004,55 @@ static void clearFieldCal() {
   vPerA = ACS712_V_PER_A_AT_5V * (vcc / ACS712_VCC_NOMINAL);
   Serial.printf("[CAL ] field calibration CLEARED. sens reverted to %.1f mV/A (from zero).\n",
                 vPerA * 1000.0f);
+}
+
+// ---- v_batt voltage offset calibration (both builds) ------------------------
+// The A1 divider (100k/10k on this PCB rev) + ADS1115 PGA can leave a small
+// fixed offset between the real battery voltage (multimeter) and the reported
+// v_batt. 'V<volts>' stores an additive correction to NVS that survives
+// reboots; 'v' clears it and reverts to the compile-time VBATT_OFFSET_V.
+//   Sign: offset is ADDED to the ADC-derived v_batt.
+//     - ADC reads LOW  vs meter -> positive offset (e.g. V0.2)
+//     - ADC reads HIGH vs meter -> negative offset (e.g. V-0.2)
+// Range-checked to +/-1.0 V so a corrupted NVS float cannot push v_batt (and
+// thus SoC endpoint recal / pLoad) by an absurd amount.
+static void setVbattOffset(float v) {
+  if (v < -1.0f) v = -1.0f;
+  if (v >  1.0f) v =  1.0f;
+  vBattOffsetV = v;
+  prefs.putFloat(KEY_VBATT_OFFSET, v);
+  prefs.putBool(KEY_VBATT_OFFSET_VALID, true);
+  Serial.printf("[CAL ] v_batt offset SAVED: %+.3f V (default %.3f). v_batt now uses this value.\n",
+                v, (float)VBATT_OFFSET_V);
+}
+
+static void clearVbattOffset() {
+  prefs.putBool(KEY_VBATT_OFFSET_VALID, false);
+  vBattOffsetV = VBATT_OFFSET_V;
+  Serial.printf("[CAL ] v_batt offset CLEARED. reverted to compile-time default %+.3f V.\n",
+                (float)VBATT_OFFSET_V);
+}
+
+// ---- v_solar voltage offset calibration (both builds) -----------------------
+// Same scheme as the v_batt offset above, but for the A0 solar-panel channel.
+// 'P<volts>' stores an additive correction to NVS (P = Panel); 'p' clears it
+// and reverts to the compile-time VSOLAR_OFFSET_V. Sign convention identical:
+// the offset is ADDED to the ADC-derived v_solar.
+static void setVsolarOffset(float v) {
+  if (v < -1.0f) v = -1.0f;
+  if (v >  1.0f) v =  1.0f;
+  vSolarOffsetV = v;
+  prefs.putFloat(KEY_VSOLAR_OFFSET, v);
+  prefs.putBool(KEY_VSOLAR_OFFSET_VALID, true);
+  Serial.printf("[CAL ] v_solar offset SAVED: %+.3f V (default %.3f). v_solar now uses this value.\n",
+                v, (float)VSOLAR_OFFSET_V);
+}
+
+static void clearVsolarOffset() {
+  prefs.putBool(KEY_VSOLAR_OFFSET_VALID, false);
+  vSolarOffsetV = VSOLAR_OFFSET_V;
+  Serial.printf("[CAL ] v_solar offset CLEARED. reverted to compile-time default %+.3f V.\n",
+                (float)VSOLAR_OFFSET_V);
 }
 
 // 't' = clock/WiFi/IQAir/SoC status, 'd' = tail of the current log, 'E' = erase logs.
@@ -998,6 +1106,20 @@ static void handleSerialCmd() {
       fieldCalSensitivity(s.toFloat());
     } else if (c == 'c') {
       clearFieldCal();
+    } else if (c == 'V') {
+      // 'V<volts>' sets the v_batt additive offset, e.g. "V0.2" or "V-0.2".
+      String s = Serial.readStringUntil('\n');
+      s.trim();
+      setVbattOffset(s.toFloat());
+    } else if (c == 'v') {
+      clearVbattOffset();
+    } else if (c == 'P') {
+      // 'P<volts>' sets the v_solar additive offset (P = Panel), e.g. "P0.1".
+      String s = Serial.readStringUntil('\n');
+      s.trim();
+      setVsolarOffset(s.toFloat());
+    } else if (c == 'p') {
+      clearVsolarOffset();
     }
   }
 }
@@ -1016,6 +1138,20 @@ static void handleSerialCmd() {
       fieldCalSensitivity(s.toFloat());
     } else if (c == 'c') {
       clearFieldCal();
+    } else if (c == 'V') {
+      // 'V<volts>' sets the v_batt additive offset, e.g. "V0.2" or "V-0.2".
+      String s = Serial.readStringUntil('\n');
+      s.trim();
+      setVbattOffset(s.toFloat());
+    } else if (c == 'v') {
+      clearVbattOffset();
+    } else if (c == 'P') {
+      // 'P<volts>' sets the v_solar additive offset (P = Panel), e.g. "P0.1".
+      String s = Serial.readStringUntil('\n');
+      s.trim();
+      setVsolarOffset(s.toFloat());
+    } else if (c == 'p') {
+      clearVsolarOffset();
     }
   }
 }
@@ -1127,7 +1263,7 @@ static void finishZero() {
   float vcc = vZero[CUR_CH[0]] * 2.0f;
   vPerA = ACS712_V_PER_A_AT_5V * (vcc / ACS712_VCC_NOMINAL);
   Serial.printf("Zero chg(A%d)=%.4f V, dis(A%d)=%.4f V | VCC~=%.2f V | sens=%.1f mV/A\n",
-                vZero[CUR_CH[0]], CUR_CH[0], vZero[CUR_CH[1]], CUR_CH[1],
+                CUR_CH[0], vZero[CUR_CH[0]], CUR_CH[1], vZero[CUR_CH[1]],
                 vcc, vPerA * 1000.0f);
 
   // Persist ONLY deliberate BOOT-press calibrations. The boot-time fallback
@@ -1170,12 +1306,19 @@ static void finishReport() {
   // so this clamp never affects calibration.
   if (chgA < 0.0f) chgA = 0.0f;
   if (disA < 0.0f) disA = 0.0f;
-  float vBatt = acc[VOLT_CH[1]].mean() * voltGain[VOLT_CH[1]];
+  // Single calibration points for v_solar (A0) and v_batt (A1): the divider
+  // multiply, then the additive offset (serial 'P<x>'/'V<x>' / NVS, or the
+  // VSOLAR_OFFSET_V/VBATT_OFFSET_V defaults). Both are declared here (before
+  // the Serial print, CSV log and telemetry block) so every downstream
+  // consumer reads THESE variables - the correction propagates everywhere
+  // from these two lines.
+  float vSolar = acc[VOLT_CH[0]].mean() * voltGain[VOLT_CH[0]] + vSolarOffsetV;
+  float vBatt = acc[VOLT_CH[1]].mean() * voltGain[VOLT_CH[1]] + vBattOffsetV;
   float netA  = chgA - disA;
   Serial.printf(
     "Solar: %6.3f V  Batt: %6.3f V | Chg: %+7.3f A (pp %.3f)  "
     "Dis: %+7.3f A (pp %.3f) | Net: %+7.3f A | SoC: %5.1f%% | raw A%d=%7.4f A%d=%7.4f (zero %.4f/%.4f)\n",
-    acc[VOLT_CH[0]].mean() * voltGain[VOLT_CH[0]],
+    vSolar,
     vBatt,
     chgA,
     chgPp / vPerA,
@@ -1198,7 +1341,7 @@ static void finishReport() {
   // Stage 4: feed the 1-minute logging aggregator with this round's means.
   // Currents reuse the clamped chgA/disA (mA) so the CSV log, MQTT telemetry
   // and SoC/energy integration all see the SAME value.
-  logAgg.add(acc[VOLT_CH[0]].mean() * voltGain[VOLT_CH[0]],
+  logAgg.add(vSolar,
              vBatt,
              chgA * 1000.0f,
              disA * 1000.0f);
@@ -1208,7 +1351,6 @@ static void finishReport() {
   // Stage 7: compute derived telemetry + cache it for getValue() (MQTT stage).
   // All float math (microseconds, no I/O inside the telemetry lock). The IQAir
   // snapshot is taken and released FIRST so the two mutexes are never nested.
-  float vSolar = acc[VOLT_CH[0]].mean() * voltGain[VOLT_CH[0]];
   float pSolar = vSolar * chgA;
   float pLoad  = vBatt  * disA;
   serviceEnergy(pSolar, pLoad);
@@ -1359,10 +1501,13 @@ void setup() {
     float z2 = prefs.getFloat(KEY_VZ2, 0.0f);
     float z3 = prefs.getFloat(KEY_VZ3, 0.0f);
     float pa = prefs.getFloat(KEY_VPA, 0.100f);
-    // Plausibility: ACS712 zero sits near VCC/2 (~2.5 V). Sensitivity can be
-    // 66 (30A) / 100 (20A) / 185 (5A) mV/A, and a field calibration may land
-    // anywhere in between, so accept a wide 40-250 mV/A window here.
-    if (z2 > 2.0f && z2 < 3.0f && z3 > 2.0f && z3 < 3.0f &&
+    // Plausibility: ACS712 zero sits at VCC/2. This board feeds the ACS712 from
+    // ~3.3 V (NOT 5 V), so the zero lands near 1.65 V — the old 2.0-3.0 V
+    // window rejected it every boot and forced a needless re-zero. Accept the
+    // full VCC/2 range for either rail: 1.4 V (VCC~2.8) up to 3.0 V (VCC~6).
+    // Sensitivity can be 66 (30A) / 100 (20A) / 185 (5A) mV/A at 5 V, ratiometric
+    // so it scales with the actual VCC; a field cal may land anywhere in 40-250.
+    if (z2 > 1.4f && z2 < 3.0f && z3 > 1.4f && z3 < 3.0f &&
         pa > 0.040f && pa < 0.250f) {
       vZero[CUR_CH[0]] = z2; vZero[CUR_CH[1]] = z3; vPerA = pa;
       haveCal = true;
@@ -1378,6 +1523,31 @@ void setup() {
     if (paCal > 0.040f && paCal < 0.250f) {
       vPerA = paCal;
       haveFieldSens = true;
+    }
+  }
+  // v_batt additive offset: NVS override (serial 'V<x>') wins over the
+  // compile-time VBATT_OFFSET_V default. Range-checked to +/-1.0 V so a
+  // corrupted NVS float cannot shift v_batt (and the SoC endpoint recal /
+  // p_load it feeds) by an absurd amount. vBattOffsetV was already seeded
+  // from VBATT_OFFSET_V at its declaration, so on an empty/invalid NVS the
+  // default simply stays in effect.
+  if (prefs.getBool(KEY_VBATT_OFFSET_VALID, false)) {
+    float ofs = prefs.getFloat(KEY_VBATT_OFFSET, 0.0f);
+    if (ofs >= -1.0f && ofs <= 1.0f) {
+      vBattOffsetV = ofs;
+    } else {
+      Serial.printf("[CAL ] stored v_batt offset %.3f V out of range (+/-1.0) - using default %.3f V\n",
+                    ofs, (float)VBATT_OFFSET_V);
+    }
+  }
+  // v_solar additive offset: same NVS-override-over-default scheme as v_batt.
+  if (prefs.getBool(KEY_VSOLAR_OFFSET_VALID, false)) {
+    float ofs = prefs.getFloat(KEY_VSOLAR_OFFSET, 0.0f);
+    if (ofs >= -1.0f && ofs <= 1.0f) {
+      vSolarOffsetV = ofs;
+    } else {
+      Serial.printf("[CAL ] stored v_solar offset %.3f V out of range (+/-1.0) - using default %.3f V\n",
+                    ofs, (float)VSOLAR_OFFSET_V);
     }
   }
   if (haveCal) {
@@ -1409,6 +1579,8 @@ void setup() {
   if (ahThroughput < 0.0) ahThroughput = 0.0;
   ahLastMs = 0;    // serviceSoH() will stamp on its first call
   sohSaveMs = millis();
+  restartLatch = prefs.getInt(KEY_RST_DAY, -1);   // daily-restart day latch (Stage 9)
+  Serial.printf("[SYS ] daily restart armed at %02d:%02d local\n", RST_HOUR, RST_MIN);
   telemetryMutex = xSemaphoreCreateMutex();
   Serial.printf("[SoH ] throughput %.1f Ah -> SoH ~%.1f%% (cycle-life %.0f, EOL %g%%)\n",
                 ahThroughput, sohPct, CYCLE_LIFE, END_OF_LIFE_SOH);
@@ -1423,5 +1595,6 @@ void loop() {
   runSampler();
   serviceNetwork();
   serviceLogger();
+  serviceDailyRestart();
   updateLed();
 }
